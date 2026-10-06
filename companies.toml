@@ -1,0 +1,106 @@
+# Companies to watch. This file is the source of truth for the registry:
+#   uv run jobradar companies sync companies.toml
+#
+# collector: which job platform the company uses: greenhouse, lever or ashby
+# board:     the company's slug on that platform:
+#              greenhouse: boards.greenhouse.io/<board> or job-boards.greenhouse.io/<board>
+#              lever:      jobs.lever.co/<board>
+#              ashby:      jobs.ashbyhq.com/<board>
+# priority:  1 = check most often, 3 = least often (used by the scheduler slice)
+# enabled:   set false to pause a company without losing its history
+#
+# Removing an entry disables that company (its jobs and history are kept).
+
+[[company]]
+name = "Stripe"
+collector = "greenhouse"
+board = "stripe"
+priority = 1
+
+[[company]]
+name = "Databricks"
+collector = "greenhouse"
+board = "databricks"
+priority = 1
+
+[[company]]
+name = "Figma"
+collector = "greenhouse"
+board = "figma"
+priority = 1
+
+[[company]]
+name = "Robinhood"
+collector = "greenhouse"
+board = "robinhood"
+priority = 2
+
+[[company]]
+name = "Airbnb"
+collector = "greenhouse"
+board = "airbnb"
+priority = 2
+
+[[company]]
+name = "Coinbase"
+collector = "greenhouse"
+board = "coinbase"
+priority = 2
+
+[[company]]
+name = "Datadog"
+collector = "greenhouse"
+board = "datadog"
+priority = 2
+
+[[company]]
+name = "Cloudflare"
+collector = "greenhouse"
+board = "cloudflare"
+priority = 3
+
+[[company]]
+name = "Discord"
+collector = "greenhouse"
+board = "discord"
+priority = 3
+
+# --- Lever ---------------------------------------------------------------
+
+[[company]]
+name = "Spotify"
+collector = "lever"
+board = "spotify"
+priority = 2
+
+[[company]]
+name = "Shield AI"
+collector = "lever"
+board = "shieldai"
+priority = 3
+
+# --- Ashby ---------------------------------------------------------------
+
+[[company]]
+name = "Ramp"
+collector = "ashby"
+board = "ramp"
+priority = 1
+
+[[company]]
+name = "OpenAI"
+collector = "ashby"
+board = "openai"
+priority = 1
+
+[[company]]
+name = "Notion"
+collector = "ashby"
+board = "notion"
+priority = 2
+
+[[company]]
+name = "Linear"
+collector = "ashby"
+board = "linear"
+priority = 3

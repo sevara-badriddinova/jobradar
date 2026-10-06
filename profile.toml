@@ -1,0 +1,60 @@
+# Your personal settings. Edit freely; this file is read on every run.
+
+[filters]
+# Cheap, deterministic rules applied by `jobradar filter` before any AI is used.
+# They reject only when confident; anything ambiguous passes through.
+# After changing them, re-apply to existing jobs with: jobradar filter --recheck
+
+us_only = true            # reject jobs whose every location is outside the US ("Remote" passes)
+max_years_required = 2   # reject when a job's *minimum* required experience is above this
+
+# Titles must contain at least one of these words/phrases. Uncomment to replace the default list:
+# title_must_include = ["engineer", "engineering", "developer", "software", "swe", "sde",
+#                       "programmer", "member of technical staff"]
+
+# Titles must contain none of these. Uncomment to replace the default list
+# (e.g. remove "intern" if you want internships):
+# title_must_exclude = [
+#     "senior", "sr", "staff", "principal", "lead", "manager", "director", "head of",
+#     "vp", "vice president", "architect", "distinguished", "fellow", "iii", "iv",
+#     "intern", "internship",
+#     "qa", "quality assurance", "test engineer", "sdet", "sales engineer", "solutions engineer",
+#     "support engineer", "customer engineer", "field engineer", "mechanical", "electrical",
+#     "civil", "hardware", "manufacturing", "aerodynamics", "aerostructures", "recruiter",
+# ]
+
+[preferences]
+# What you want that your resume can't say. The AI matcher reads all of this.
+resume = "resume.pdf"            # used by `jobradar profile extract` when no path is given
+target_roles = ["Software Engineer", "Backend Engineer"]
+interests = ["backend", "distributed systems"]
+avoid = ["QA / test-only roles", "frontend-only roles"]
+needs_visa_sponsorship = true    # H-1B: postings that rule out sponsorship are filtered out and scored lower
+notes = ""                       # anything else, e.g. "open to relocating anywhere in the US"
+
+[notifications]
+# Matches at or above immediate_min_score are sent to Telegram right away (`jobradar notify`).
+# Matches between digest_min_score and immediate_min_score wait for `jobradar notify --digest`.
+# Below digest_min_score they're only stored (see them with `jobradar top --min-score 0`).
+immediate_min_score = 80
+digest_min_score = 70
+
+# Job Applications tracker: column names and statuses verified in its browser view.
+# Credentials and tracker ID belong in .env; see docs/11-notion.md.
+[notion]
+company_property = "Company"
+role_property = "Job Title"
+status_property = "Application Status"
+date_property = "Date Applied"
+
+[notion.status_map]
+"Not Started" = "SKIP"
+"Applied" = "APPLIED"
+"Rejected" = "REJECTED"
+"Interview Scheduled" = "INTERVIEW"
+"Interview Completed" = "INTERVIEW"
+"Offer Received" = "OFFER"
+"Accepted" = "OFFER"
+"OA completed" = "INTERVIEW"
+"OA received" = "INTERVIEW"
+"Rejected after OA" = "REJECTED"

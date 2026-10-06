@@ -1,0 +1,59 @@
+{
+  "jobs": [
+    {
+      "id": "34413f8d-26bf-4bbc-8ade-eb309a0e2245",
+      "title": "Software Engineer, New Grad",
+      "department": "Engineering",
+      "team": "Backend",
+      "employmentType": "FullTime",
+      "location": "New York, NY (HQ)",
+      "shouldDisplayCompensationOnJobPostings": true,
+      "secondaryLocations": [
+        {"location": "Remote (US)", "address": {"postalAddress": {"addressCountry": "United States"}}},
+        {"location": "Miami, FL", "address": {"postalAddress": {"addressRegion": "Florida", "addressCountry": "USA", "addressLocality": "Miami"}}}
+      ],
+      "publishedAt": "2026-09-30T17:12:35.753+00:00",
+      "isListed": true,
+      "isRemote": true,
+      "workplaceType": "Hybrid",
+      "address": {"postalAddress": {"addressRegion": "NY", "addressCountry": "USA", "addressLocality": "New York City"}},
+      "jobUrl": "https://jobs.ashbyhq.com/acme/34413f8d-26bf-4bbc-8ade-eb309a0e2245",
+      "applyUrl": "https://jobs.ashbyhq.com/acme/34413f8d-26bf-4bbc-8ade-eb309a0e2245/application",
+      "descriptionHtml": "<h1><strong>About Acme</strong></h1><p style=\"min-height:1.5em\">Build backend services in Kotlin &amp; Postgres.</p><h2>Requirements</h2><ul><li><p>BS in CS</p></li><li><p>0-2 years of experience</p></li></ul>",
+      "descriptionPlain": "ABOUT ACME\n\nBuild backend services in Kotlin & Postgres.",
+      "compensation": {
+        "compensationTierSummary": "$140K – $170K • Offers Equity",
+        "summaryComponents": [
+          {"compensationType": "Salary", "interval": "1 YEAR", "currencyCode": "USD", "minValue": 140000, "maxValue": 170000}
+        ]
+      }
+    },
+    {
+      "id": "6f9e2b1a-0000-4000-8000-000000000002",
+      "title": "Staff Security Engineer",
+      "department": "Engineering",
+      "employmentType": "FullTime",
+      "location": "Remote (Canada)",
+      "publishedAt": "2026-08-01T09:00:00Z",
+      "isListed": true,
+      "jobUrl": "https://jobs.ashbyhq.com/acme/6f9e2b1a-0000-4000-8000-000000000002",
+      "descriptionHtml": "",
+      "descriptionPlain": "Secure all the things."
+    },
+    {
+      "id": "unlisted-0000-4000-8000-000000000003",
+      "title": "Referral-only Engineer",
+      "location": "New York, NY",
+      "publishedAt": "2026-09-01T09:00:00Z",
+      "isListed": false,
+      "jobUrl": "https://jobs.ashbyhq.com/acme/unlisted-0000-4000-8000-000000000003",
+      "descriptionHtml": "<p>Hidden.</p>"
+    },
+    {
+      "id": "broken-0000-4000-8000-000000000004",
+      "location": "New York, NY",
+      "isListed": true,
+      "jobUrl": "https://jobs.ashbyhq.com/acme/broken-0000-4000-8000-000000000004"
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "jobs": [
+    {
+      "id": 7001,
+      "internal_job_id": 3001,
+      "title": "Software Engineer, New Grad",
+      "company_name": "Acme",
+      "location": {"name": "New York, NY"},
+      "absolute_url": "https://acme.com/careers?gh_jid=7001&gh_src=linkedin",
+      "updated_at": "2026-10-01T12:00:00-04:00",
+      "first_published": "2026-09-30T09:00:00-04:00",
+      "requisition_id": "R-1",
+      "content": "&lt;h2&gt;About the role&lt;/h2&gt;&lt;p&gt;Build &lt;strong&gt;backend&lt;/strong&gt; services in Java.&lt;/p&gt;&lt;ul&gt;&lt;li&gt;0-2 years&lt;/li&gt;&lt;li&gt;BS in CS&lt;/li&gt;&lt;/ul&gt;"
+    },
+    {
+      "id": 7002,
+      "title": "Senior Staff Engineer",
+      "company_name": "Acme",
+      "location": {"name": "Remote - US"},
+      "absolute_url": "https://acme.com/careers?gh_jid=7002",
+      "updated_at": "2026-10-02T12:00:00Z",
+      "content": "&lt;p&gt;Lead things.&lt;/p&gt;"
+    },
+    {
+      "id": 7003,
+      "company_name": "Acme",
+      "absolute_url": "https://acme.com/careers?gh_jid=7003",
+      "content": "missing a title, should be skipped"
+    }
+  ],
+  "meta": {"total": 3}
+}

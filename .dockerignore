@@ -1,0 +1,13 @@
+# Allowlist: never send credentials, resumes, or the local virtualenv to a build.
+**
+!Dockerfile
+!.dockerignore
+!pyproject.toml
+!uv.lock
+!README.md
+!companies.toml
+!profile.toml
+!src/
+!src/**
+**/__pycache__/
+**/*.pyc

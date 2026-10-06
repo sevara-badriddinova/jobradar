@@ -1,0 +1,15 @@
+**
+!.gcloudignore
+!.dockerignore
+!Dockerfile
+!pyproject.toml
+!uv.lock
+!README.md
+!companies.toml
+!profile.toml
+!src/
+!src/**
+!deploy/
+!deploy/cloudbuild.yaml
+**/__pycache__/
+**/*.pyc

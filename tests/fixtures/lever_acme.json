@@ -1,0 +1,47 @@
+[
+  {
+    "id": "6ed76ce8-4156-4b60-b120-403538bd66cd",
+    "text": "Software Engineer, New Grad",
+    "hostedUrl": "https://jobs.lever.co/acme/6ed76ce8-4156-4b60-b120-403538bd66cd",
+    "applyUrl": "https://jobs.lever.co/acme/6ed76ce8-4156-4b60-b120-403538bd66cd/apply",
+    "createdAt": 1790000000000,
+    "categories": {
+      "commitment": "Full-time",
+      "location": "New York, NY",
+      "team": "Engineering",
+      "department": "R&D",
+      "allLocations": ["New York, NY", "Seattle, WA"]
+    },
+    "workplaceType": "hybrid",
+    "country": "US",
+    "description": "<div><b>About the role</b></div><div>Build backend services in Java &amp; Go.</div>",
+    "descriptionPlain": "About the role\nBuild backend services in Java & Go.",
+    "lists": [
+      {"text": "What you'll do", "content": "<li>Design APIs</li><li>Ship to production</li>"},
+      {"text": "Requirements", "content": "<li>BS in Computer Science</li><li>0-2 years of experience</li>"}
+    ],
+    "additional": "<div>We offer great benefits.</div>",
+    "additionalPlain": "We offer great benefits.",
+    "salaryRange": {"currency": "USD", "interval": "per-year-salary", "min": 130000, "max": 160000}
+  },
+  {
+    "id": "ac978161-6f46-4f6b-ad9e-a258e642751c",
+    "text": "Senior Staff Engineer",
+    "hostedUrl": "https://jobs.lever.co/acme/ac978161-6f46-4f6b-ad9e-a258e642751c",
+    "applyUrl": "https://jobs.lever.co/acme/ac978161-6f46-4f6b-ad9e-a258e642751c/apply",
+    "createdAt": 1711403416463,
+    "categories": {"commitment": "Full-time", "location": "London, United Kingdom", "team": "Engineering"},
+    "workplaceType": "on-site",
+    "country": "GB",
+    "description": "",
+    "descriptionPlain": "Lead the platform team.",
+    "lists": [],
+    "additional": "",
+    "additionalPlain": ""
+  },
+  {
+    "id": "0b0b0b0b-0000-0000-0000-000000000003",
+    "hostedUrl": "https://jobs.lever.co/acme/0b0b0b0b-0000-0000-0000-000000000003",
+    "description": "missing the title (text), should be skipped"
+  }
+]
