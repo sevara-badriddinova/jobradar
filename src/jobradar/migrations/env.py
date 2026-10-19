@@ -8,7 +8,8 @@ config = context.config
 
 
 def run(connection) -> None:
-    context.configure(connection=connection, target_metadata=metadata, compare_type=True)
+    context.configure(connection=connection, target_metadata=metadata, compare_type=True,
+                      transaction_per_migration=True)
     with context.begin_transaction():
         context.run_migrations()
 

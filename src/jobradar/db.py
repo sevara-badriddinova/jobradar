@@ -10,8 +10,8 @@ import os
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import (
-    BigInteger, Boolean, CheckConstraint, Column, DateTime, ForeignKey, Identity,
-    Index, Integer, MetaData, Numeric, Table, Text, UniqueConstraint, create_engine,
+    BigInteger, Boolean, CheckConstraint, Column, Date, DateTime, ForeignKey, Identity,
+    Index, Integer, MetaData, Numeric, SmallInteger, Table, Text, UniqueConstraint, create_engine,
     func, inspect, text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -85,6 +85,14 @@ jobs = Table(
     Index("ix_jobs_open_by_board", "source", "board",           # close detection
           postgresql_where=text("closed_at IS NULL")),
     Index("ix_jobs_status_first_seen", "status", "first_seen_at"),  # work queues
+    Index("ix_jobs_company_key", "company_key"),
+    Index("ix_jobs_open_publication", "posted_at", "id",
+          postgresql_where=text("closed_at IS NULL")),
+    Index("ix_jobs_pending_filter", "id", postgresql_where=text(
+        "closed_at IS NULL AND (filtered_at IS NULL OR filter_reason = 'posting date: in the future')")),
+    Index("ix_jobs_expiry_candidates", "posted_at", postgresql_where=text(
+        "closed_at IS NULL AND (filtered_at IS NULL OR status <> 'FILTERED' OR filter_reason IS NULL "
+        "OR filter_reason NOT LIKE 'posting date:%' OR filter_reason = 'posting date: in the future')")),
 )
 
 companies = Table(
@@ -153,6 +161,7 @@ notifications = Table(
     Column("message_id", BigInteger),                 # Telegram's id, to edit the buttons later
     Column("created_at", TS, nullable=False, server_default=func.now()),
     Column("sent_at", TS),
+    Column("origin_at", TS),                          # job became new/changed (latency metric)
     UniqueConstraint("job_id", "channel", name="uq_notifications_job_channel"),
     CheckConstraint("kind IN ('immediate','digest')", name="ck_notifications_kind"),
     CheckConstraint("status IN ('pending','sending','sent','failed','cancelled')",
@@ -232,6 +241,63 @@ processed_emails = Table(
     Column("processed_at", TS, nullable=False, server_default=func.now()),
 )
 
+# --- continuous workers (migration 0010) ------------------------------------------
+
+# Collection schedule and lease per registry board.
+board_state = Table(
+    "board_state",
+    metadata,
+    Column("company_id", BigInteger, ForeignKey("companies.id", ondelete="CASCADE"), primary_key=True),
+    Column("next_due_at", TS, nullable=False, server_default=func.now()),
+    Column("lease_owner", Text),
+    Column("lease_until", TS),
+    Column("consecutive_failures", Integer, nullable=False, server_default="0"),
+    Column("last_started_at", TS),
+    Column("last_finished_at", TS),
+    Column("last_success_at", TS),
+    Column("last_error", Text),
+    Column("last_bytes", BigInteger),
+    Column("last_fetched", Integer),
+    Index("ix_board_state_due", "next_due_at"),
+)
+
+# Durable filter/match tasks; one per (kind, job).
+work_queue = Table(
+    "work_queue",
+    metadata,
+    Column("id", BigInteger, Identity(), primary_key=True),
+    Column("kind", Text, nullable=False),
+    Column("job_id", BigInteger, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False),
+    Column("state", Text, nullable=False, server_default="ready"),
+    Column("priority", SmallInteger, nullable=False, server_default="100"),
+    Column("generation", Integer, nullable=False, server_default="0"),
+    Column("attempts", Integer, nullable=False, server_default="0"),
+    Column("max_attempts", Integer, nullable=False, server_default="5"),
+    Column("available_at", TS, nullable=False, server_default=func.now()),
+    Column("origin_at", TS, nullable=False, server_default=func.now()),
+    Column("created_at", TS, nullable=False, server_default=func.now()),
+    Column("lease_owner", Text),
+    Column("lease_until", TS),
+    Column("last_error", Text),
+    UniqueConstraint("kind", "job_id", name="uq_work_queue_kind_job"),
+    CheckConstraint("kind IN ('filter','match')", name="ck_work_queue_kind"),
+    CheckConstraint("state IN ('ready','leased','dead')", name="ck_work_queue_state"),
+    Index("ix_work_queue_claim", "kind", "priority", "available_at", "id",
+          postgresql_where=text("state <> 'dead'")),
+)
+
+# Daily AI spend ledger (UTC days) behind the matching budget cap.
+ai_usage = Table(
+    "ai_usage",
+    metadata,
+    Column("day", Date, primary_key=True),
+    Column("model", Text, primary_key=True),
+    Column("calls", Integer, nullable=False, server_default="0"),
+    Column("input_tokens", BigInteger, nullable=False, server_default="0"),
+    Column("output_tokens", BigInteger, nullable=False, server_default="0"),
+    Column("cost_usd", Numeric(12, 6), nullable=False, server_default="0"),
+)
+
 collector_runs = Table(
     "collector_runs",
     metadata,
@@ -253,13 +319,17 @@ collector_runs = Table(
 )
 
 
-def make_engine(url: str | None = None) -> Engine:
-    url = url or os.environ.get("JOBRADAR_DATABASE_URL", DEFAULT_DATABASE_URL)
+def make_engine(url: str | None = None, **pool_options) -> Engine:
+    # Neon env pull supplies these standard names. Prefer its direct URL:
+    # CLI workers and migrations also use session-level advisory locks.
+    url = (url or os.environ.get("JOBRADAR_DATABASE_URL")
+           or os.environ.get("DATABASE_URL_UNPOOLED") or os.environ.get("DATABASE_URL")
+           or DEFAULT_DATABASE_URL)
     # Neon supplies a standard PostgreSQL URL; explicitly select our psycopg 3 driver.
     parsed = make_url(url)
     if parsed.drivername in {"postgres", "postgresql"}:
         parsed = parsed.set(drivername="postgresql+psycopg")
-    return create_engine(parsed, pool_pre_ping=True, connect_args={"connect_timeout": 30})
+    return create_engine(parsed, pool_pre_ping=True, connect_args={"connect_timeout": 30}, **pool_options)
 
 
 def migrate(engine: Engine) -> None:
@@ -273,4 +343,8 @@ def migrate(engine: Engine) -> None:
             # Created by `init-db` before migrations existed: it already has the
             # baseline schema, so record that instead of re-creating tables.
             command.stamp(config, "0001")
+    # Alembic owns migration transactions, including the commit boundaries
+    # required by CREATE INDEX CONCURRENTLY.
+    with engine.connect() as conn:
+        config.attributes["connection"] = conn
         command.upgrade(config, "head")

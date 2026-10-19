@@ -98,3 +98,32 @@ def test_review_migration_preserves_previous_button_choices(scratch):
     with scratch.connect() as conn:
         assert conn.execute(text("SELECT job_id, choice FROM job_reviews ORDER BY job_id")).all() == [
             (1, "IGNORED"), (2, "APPLIED")]
+
+
+def test_publication_migration_removes_update_fallback_and_preserves_original_date(scratch):
+    from datetime import UTC, datetime
+    from alembic import command
+    from jobradar.db import jobs
+    from sqlalchemy import select
+    from tests.factories import make_job
+    from tests.integration.helpers import ingest
+
+    config = Config()
+    config.set_main_option("script_location", "jobradar:migrations")
+    with scratch.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, "0007")
+    old_date = datetime(2026, 8, 1, tzinfo=UTC)
+    records = [
+        make_job('known', title='Engineer known').model_copy(update={
+            'raw': {'first_published': old_date.isoformat(), 'updated_at': '2026-10-06T14:00:00Z'}}),
+        make_job('unknown', title='Engineer unknown').model_copy(update={
+            'raw': {'updated_at': '2026-10-06T14:00:00Z'}}),
+        make_job('invalid', title='Engineer invalid').model_copy(update={
+            'raw': {'first_published': 'yesterday', 'updated_at': '2026-10-06T14:00:00Z'}}),
+    ]
+    ingest(scratch, records)
+    migrate(scratch)
+    with scratch.connect() as conn:
+        dates = dict(conn.execute(select(jobs.c.source_job_id, jobs.c.posted_at)).all())
+    assert dates == {'known': old_date, 'unknown': None, 'invalid': None}

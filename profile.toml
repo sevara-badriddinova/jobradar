@@ -2,11 +2,13 @@
 
 [filters]
 # Cheap, deterministic rules applied by `jobradar filter` before any AI is used.
-# They reject only when confident; anything ambiguous passes through.
+# Ambiguous role requirements pass; the posting-age cutoff requires a known date.
 # After changing them, re-apply to existing jobs with: jobradar filter --recheck
 
 us_only = true            # reject jobs whose every location is outside the US ("Remote" passes)
 max_years_required = 2   # reject when a job's *minimum* required experience is above this
+max_posting_age_days = 3 # known publication date within the last 72 hours
+require_explicit_sponsorship = true # the specific posting must offer immigration support
 
 # Titles must contain at least one of these words/phrases. Uncomment to replace the default list:
 # title_must_include = ["engineer", "engineering", "developer", "software", "swe", "sde",
@@ -33,6 +35,7 @@ needs_visa_sponsorship = true    # H-1B: postings that rule out sponsorship are 
 notes = ""                       # anything else, e.g. "open to relocating anywhere in the US"
 
 [notifications]
+delivery = "alerts"             # send new Telegram messages for qualifying matches
 # Matches at or above immediate_min_score are sent to Telegram right away (`jobradar notify`).
 # Matches between digest_min_score and immediate_min_score wait for `jobradar notify --digest`.
 # Below digest_min_score they're only stored (see them with `jobradar top --min-score 0`).

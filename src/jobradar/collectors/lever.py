@@ -28,7 +28,12 @@ class LeverCollector(JobCollector):
     max_pages = 50  # 5,000 postings: far beyond any real company; stops runaway loops
 
     def collect(self) -> list[Job]:
-        url = API_URL.format(board=self.board)
+        board = self.board
+        api = API_URL
+        if board.startswith("eu:"):
+            board = board[3:]
+            api = api.replace("api.lever.co", "api.eu.lever.co")
+        url = api.format(board=board)
         records: list[Any] = []
         seen: set[str | None] = set()
         for page_number in range(self.max_pages):

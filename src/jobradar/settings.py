@@ -19,6 +19,8 @@ class FilterSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     us_only: bool = True
+    max_posting_age_days: int | None = Field(default=None, ge=1)
+    require_explicit_sponsorship: bool = False
     # Reject a job whose *minimum* stated experience is above this many years.
     max_years_required: int = Field(default=4, ge=0)
     # Title must contain at least one of these (empty list = no requirement).
@@ -55,6 +57,8 @@ class Preferences(BaseModel):
 
 class NotificationSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+    delivery: Literal["alerts", "queue"] = "alerts"
 
     immediate_min_score: float = Field(default=80, ge=0, le=100)  # alert right away
     digest_min_score: float = Field(default=70, ge=0, le=100)     # collected into the digest

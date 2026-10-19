@@ -78,3 +78,14 @@ def test_cycle_budgets_must_be_positive(argv):
 
 def test_digest_requires_notify():
     assert cli.main(["cycle", "--digest"]) == 2
+
+
+@pytest.mark.parametrize("failure,progress", [(None, True), ("collect", True),
+    ("applications", False), ("filter", False), ("match", False), ("notify", False)])
+def test_heartbeat_only_after_pipeline_reaches_final_stage(monkeypatch, failure, progress):
+    from jobradar import health
+    heartbeats = []
+    monkeypatch.setattr(health, "record_progress", lambda: heartbeats.append(True))
+    run_cycle(options(applications="notion", match=True, notify=True),
+              lambda argv: int(argv[2] == failure))
+    assert bool(heartbeats) == progress

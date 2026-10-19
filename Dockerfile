@@ -13,7 +13,8 @@ RUN uv sync --locked --no-dev --no-install-project
 COPY src ./src
 RUN uv sync --locked --no-dev --no-editable
 COPY --chown=10001:10001 companies.toml profile.toml ./
-RUN useradd --system --uid 10001 --create-home jobradar
+RUN useradd --system --uid 10001 --create-home jobradar \
+    && chown 10001:10001 /app
 USER 10001
 ENTRYPOINT ["jobradar"]
 CMD ["cycle"]

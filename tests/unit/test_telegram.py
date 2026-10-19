@@ -37,7 +37,71 @@ def test_get_updates_long_polls_with_a_longer_http_timeout(server, monkeypatch):
     tg.get_updates(5, timeout=25)
     assert server.calls[-1] == ("getUpdates", {"offset": 5, "timeout": 25,
                                                "allowed_updates": ["message", "callback_query"]})
-    assert timeouts == [35]  # the HTTP request must outlive Telegram's long poll
+    assert timeouts == [30]  # the HTTP request must outlive Telegram's long poll
+
+
+@pytest.mark.parametrize("failure", [httpx.ReadTimeout("slow"),
+    (502, {"ok": False, "description": "Bad Gateway"})])
+def test_scan_update_read_retries_same_offset_once(server, failure):
+    server.fail("getUpdates", failure)
+    tg, sleeps = bot(server)
+    assert tg.get_updates(42) == []
+    assert sleeps == [0.5]
+    assert len(server.calls) == 2
+    assert all(params["offset"] == 42 for _, params in server.calls)
+
+
+def test_scan_update_read_stops_after_second_failure(server):
+    server.fail("getUpdates", httpx.ReadTimeout("slow"), httpx.ReadTimeout("slow again"))
+    tg, sleeps = bot(server)
+    with pytest.raises(TelegramError):
+        tg.get_updates(42)
+    assert len(server.calls) == 2 and sleeps == [0.5]
+
+
+def test_edit_message_updates_text_and_controls_in_place(server):
+    tg, _ = bot(server)
+    buttons = [[{"text": "Like", "callback_data": "q:like:7:new:0"}]]
+    tg.edit_message(42, 101, "<b>Your jobs</b>", buttons)
+    assert server.sent == []
+    assert server.edited == [{"chat_id": 42, "message_id": 101, "text": "<b>Your jobs</b>",
+                             "parse_mode": "HTML", "link_preview_options": {"is_disabled": True},
+                             "reply_markup": {"inline_keyboard": buttons}}]
+
+
+def test_job_navigation_menu_is_chat_scoped_and_sends_no_message(server):
+    tg, _ = bot(server)
+    tg.setup_menu("42")
+    method, payload = server.calls[0]
+    assert method == "setMyCommands" and payload["scope"] == {"type": "chat", "chat_id": 42}
+    assert [c["command"] for c in payload["commands"]] == ["new", "liked", "applied", "skipped", "menu"]
+    assert server.calls[1] == ("setChatMenuButton", {"chat_id": 42, "menu_button": {"type": "commands"}})
+    assert server.sent == []
+
+
+@pytest.mark.parametrize("method", ["answerCallbackQuery", "editMessageReplyMarkup", "getUpdates", "sendMessage"])
+def test_interactive_calls_fail_fast_instead_of_blocking_next_click(server, method, monkeypatch):
+    server.fail(method, httpx.ConnectError("offline"))
+    tg, sleeps = bot(server)
+    timeouts, real_post = [], tg._client.post
+
+    def post(url, json, timeout):
+        timeouts.append(timeout)
+        return real_post(url, json=json, timeout=timeout)
+
+    monkeypatch.setattr(tg._client, "post", post)
+    with pytest.raises(TelegramError):
+        if method == "answerCallbackQuery":
+            tg.answer_callback("cb1", "Saved")
+        elif method == "editMessageReplyMarkup":
+            tg.edit_buttons(42, 101, [])
+        elif method == "sendMessage":
+            tg.send_message(42, "Queue", http_timeout=3, max_attempts=1)
+        else:
+            tg.get_updates(0, timeout=5)
+    assert sleeps == []
+    assert len(server.calls) == 1
+    assert timeouts == [10 if method == "getUpdates" else 3]
 
 
 def test_rate_limit_waits_retry_after_then_succeeds(server):

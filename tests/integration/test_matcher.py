@@ -59,7 +59,7 @@ def test_matches_only_open_jobs_that_passed_the_filters(engine, llm):
     with engine.connect() as conn:
         m = conn.execute(select(job_matches).where(job_matches.c.id == j.match_id)).one()
     assert m.profile_id == profile.id and m.assessment["missing_skills"] == ["Kafka"]
-    assert m.context_hash == context_hash(profile.id, PREFS) and float(m.score) == 79.5
+    assert m.context_hash == context_hash(profile.id, PREFS, j, profile.profile) and float(m.score) == 79.5
 
 
 def test_running_again_does_nothing(engine, llm):
@@ -111,10 +111,11 @@ def test_rematch_after_changing_preferences_or_profile_asks_again(engine, llm):
 def test_limit_takes_the_newest_jobs_first(engine, llm):
     seed(engine, n=5)
     fake = llm(assessment())
-    result = run_matching(engine, add_profile(engine), PREFS, limit=2)
+    profile = add_profile(engine)
+    result = run_matching(engine, profile, PREFS, limit=2)
     assert result.assessed == 2
     assert "Backend Engineer 4" in fake.calls[0]["prompt"] or "Backend Engineer 3" in fake.calls[0]["prompt"]
-    assert run_matching(engine, add_profile(engine), PREFS, limit=10).assessed == 3  # the rest
+    assert run_matching(engine, profile, PREFS, limit=10).assessed == 3  # the rest
 
 
 def test_one_failure_does_not_stop_the_rest_and_is_retried_next_time(engine, llm):
@@ -156,7 +157,7 @@ def test_closed_jobs_are_not_matched(engine, llm):
 def test_concurrent_run_storing_first_wins(engine, monkeypatch):
     seed(engine, n=1)
     profile = add_profile(engine)
-    key = context_hash(profile.id, PREFS)
+    key = context_hash(profile.id, PREFS, row(engine, "j0"), profile.profile)
     job_id = row(engine, "j0").id
 
     def other_process_got_there_first(output, *, system, prompt, model, max_tokens=4096):
@@ -179,9 +180,14 @@ class TestCli:
     def test_match_then_top(self, engine, db_env, llm, capsys):
         seed(engine)
         add_profile(engine)
+        with engine.begin() as conn:
+            conn.execute(update(jobs_t).where(jobs_t.c.source_job_id == "j0").values(
+                description="At least 5 years of professional experience required."))
         llm(assessment(role_match=10, technical_match=10, experience_match=10, reasons=["Great fit"]),
             assessment(role_match=5, technical_match=5, experience_match=5),
-            assessment(eligible=False, ineligible_reason="needs clearance", concerns=["Clearance"]))
+            assessment(eligible=False, ineligible_reason="needs 5 years", concerns=["Experience"],
+                       hard_blockers=[{"kind": "experience", "job_quote": "At least 5 years of professional experience required.",
+                                       "candidate_field": "years_of_experience", "candidate_fact": "0.0"}]))
         assert cli.main(["match"]) == 0
         assert "assessed 3, reused 0 cached, failed 0" in capsys.readouterr().out
 

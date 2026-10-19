@@ -1,9 +1,11 @@
 import httpx
+import pytest
 from sqlalchemy import func, select, text, update
 
-from jobradar.db import applications, job_reviews, jobs, review_responses
+from jobradar.db import applications, job_reviews, jobs
 from jobradar.notifications import CONSUMER_LOCK, process_updates, refresh_buttons, send_digest, send_immediate
-from jobradar.review import queue_messages, save_summary, set_choice
+from jobradar.review import queue_messages, set_choice
+from jobradar.queue_ui import read_state, request_queue
 from tests.integration.test_notifications import CHAT, matched, queue, server, tg
 from tests.integration.helpers import row
 
@@ -23,7 +25,10 @@ def test_reviews_build_ranked_queue_then_automatically_present_it(engine, server
     assert len(server.sent) == 3  # still reviewing: no premature summary
     assert press(engine, server, tg, "ignored", "c") == 1
     summary = server.sent[-1]["text"]
-    assert "0 role(s) left" in summary
+    assert "New · 0 jobs" in summary
+    server.press("q:list:liked:0", chat_id=CHAT)
+    process_updates(engine, tg, CHAT)
+    summary = server.edited[-1]["text"]
     assert summary.index("Engineer b") < summary.index("Engineer a")
     assert "96%" in summary and "83%" in summary and "Engineer c" not in summary
     assert row(engine, "a").status == "NOTIFIED"  # queued does not mean applied
@@ -86,21 +91,24 @@ def test_queue_commands_are_private_and_repeat_updates_are_idempotent(engine, se
     for command in ("/queue", "/done", "/queue@jobradar_test_bot"):
         server.message_from(int(CHAT), "User", command)
         process_updates(engine, tg, CHAT)
-        assert "Engineer a" in server.sent[-1]["text"]
-    assert len(server.sent) == 3
+        assert "Your jobs" in server.sent[-1]["text"]
+    assert len(server.sent) == 1
+    server.press("q:list:liked:0", chat_id=CHAT)
     process_updates(engine, tg, CHAT)
-    assert len(server.sent) == 3
+    assert "Engineer a" in server.edited[-1]["text"]
+    process_updates(engine, tg, CHAT)
+    assert len(server.sent) == 1
 
 
 def test_persisted_summary_sends_after_restart_and_unknown_delivery_is_not_retried(engine, server, tg):
     with engine.begin() as conn:
-        save_summary(conn, 23)
+        request_queue(conn, CHAT)
     server.fail("sendMessage", httpx.ReadTimeout("unknown delivery"))
     process_updates(engine, tg, CHAT)
     process_updates(engine, tg, CHAT)
     assert len([m for m, _ in server.calls if m == "sendMessage"]) == 1
     with engine.connect() as conn:
-        assert conn.execute(select(review_responses.c.status)).scalar_one() == "sending"
+        assert read_state(conn, CHAT)["sending"] is True
     server.message_from(int(CHAT), "User", "/queue")
     process_updates(engine, tg, CHAT)
     assert len(server.sent) == 1  # explicit recovery
@@ -116,8 +124,10 @@ def test_digest_buttons_preserve_other_roles_and_finish_the_list(engine, server,
         process_updates(engine, tg, CHAT)
     buttons = [p for m, p in server.calls if m == "editMessageReplyMarkup"][-1]["reply_markup"]["inline_keyboard"]
     callbacks = {b["callback_data"] for r in buttons for b in r}
-    assert {f"queue:{row(engine, 'a').id}", f"queue:{row(engine, 'b').id}"} <= callbacks
-    assert "73%" in server.sent[-1]["text"] and "Engineer b" not in server.sent[-1]["text"]
+    assert {f"q:open:{row(engine, 'a').id}:new:0", f"q:open:{row(engine, 'b').id}:new:0"} <= callbacks
+    server.press("q:list:liked:0", chat_id=CHAT)
+    process_updates(engine, tg, CHAT)
+    assert "73%" in server.edited[-1]["text"] and "Engineer b" not in server.edited[-1]["text"]
     assert refresh_buttons(engine, tg, CHAT) == 1
 
 
@@ -140,6 +150,44 @@ def test_huge_callback_id_is_acknowledged_without_crashing_listener(engine, serv
     assert any(m == "answerCallbackQuery" for m, _ in server.calls)
 
 
+def test_consumer_lock_is_released_after_processing_failure(engine, server, tg, monkeypatch):
+    from jobradar import notifications
+
+    original = notifications._process_updates
+    def fail(*args):
+        raise RuntimeError("processing failed")
+    monkeypatch.setattr(notifications, "_process_updates", fail)
+    with engine.connect() as other:
+        # Hold a separate backend so this cannot pass by reacquiring a leaked
+        # session lock on the very same pooled connection.
+        with pytest.raises(RuntimeError, match="processing failed"):
+            process_updates(engine, tg, CHAT)
+        assert other.execute(text("SELECT pg_try_advisory_xact_lock(:key)"),
+                             {"key": CONSUMER_LOCK}).scalar_one()
+    monkeypatch.setattr(notifications, "_process_updates", original)
+    server.message_from(int(CHAT), "User", "/queue")
+    process_updates(engine, tg, CHAT)
+    assert len(server.sent) == 1
+
+
+def test_rapid_clicks_are_saved_and_answered_before_edits_and_pending_summaries(engine, server, tg):
+    matched(engine, {"a": 90})
+    job_id = row(engine, "a").id
+    with engine.begin() as conn:
+        request_queue(conn, CHAT)
+    server.press(f"queue:{job_id}", chat_id=CHAT)
+    server.press(f"ignored:{job_id}", chat_id=CHAT)
+    assert process_updates(engine, tg, CHAT) == 2
+    methods = [method for method, _ in server.calls]
+    assert methods == ["getUpdates", "answerCallbackQuery", "answerCallbackQuery",
+                       "editMessageReplyMarkup", "sendMessage"]
+    with engine.connect() as conn:
+        assert conn.execute(select(job_reviews.c.choice)).scalar_one() == "IGNORED"
+    edited = next(payload for method, payload in server.calls if method == "editMessageReplyMarkup")
+    assert any(button["text"] == "✓ Not interested"
+               for buttons in edited["reply_markup"]["inline_keyboard"] for button in buttons)
+
+
 def test_large_queue_is_split_and_html_is_escaped(engine):
     matched(engine, {str(i): 90 for i in range(100)})
     with engine.begin() as conn:
@@ -159,4 +207,4 @@ def test_unsent_daily_digest_does_not_block_current_review_completion(engine, se
     send_immediate(engine, tg, CHAT)
     press(engine, server, tg, "queue", "a")
     assert len(server.sent) == 2
-    assert "0 role(s) left" in server.sent[-1]["text"]
+    assert "Engineer later" in server.sent[-1]["text"]

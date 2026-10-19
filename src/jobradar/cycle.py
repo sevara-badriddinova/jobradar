@@ -39,7 +39,11 @@ def run_cycle(args, run: Callable[[list[str]], int]) -> int:
         log.info("cycle stage finished: %s (exit=%s)", argv[0], result)
         return result
 
-    collect_status = stage("collect")
+    if getattr(args, "discover", False):
+        # A directory outage must not stop polling the existing registry.
+        stage("companies", "discover")
+    collect_limit = getattr(args, "collect_limit", None)
+    collect_status = stage("collect", *(["--limit", str(collect_limit)] if collect_limit else []))
     if collect_status not in (0, 1):
         return collect_status
     if args.applications != "none":
@@ -60,4 +64,7 @@ def run_cycle(args, run: Callable[[list[str]], int]) -> int:
         status = stage("notify", *(["--digest"] if args.digest else []))
         if status:
             return status
+    from jobradar.health import record_progress
+    if not match_status:
+        record_progress()
     return max(collect_status, match_status)

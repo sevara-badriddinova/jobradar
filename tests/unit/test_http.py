@@ -89,11 +89,18 @@ def test_garbage_retry_after_falls_back_to_backoff():
     assert 0 <= sleeps[0] <= 1.0
 
 
-def test_invalid_json_is_a_fetch_error_not_retried():
+def test_persistent_invalid_json_stops_after_one_retry():
     t = RecordingTransport(httpx.Response(200, text="<html>maintenance</html>"))
     with pytest.raises(FetchError, match="invalid JSON"):
         call(t)
-    assert len(t.requests) == 1
+    assert len(t.requests) == 2
+
+
+def test_temporary_html_response_retries_then_returns_json():
+    t = RecordingTransport(httpx.Response(200, text="<html>maintenance</html>"),
+                           httpx.Response(200, json={"jobs": []}))
+    result, sleeps = call(t)
+    assert result == {"jobs": []} and len(sleeps) == 1
 
 
 @pytest.mark.parametrize("attempt,upper", [(0, 1), (1, 2), (2, 4), (3, 8), (10, 30)])
@@ -101,3 +108,17 @@ def test_backoff_delay_is_jittered_exponential_and_capped(attempt, upper):
     samples = [backoff_delay(attempt, base=1.0, cap=30.0) for _ in range(200)]
     assert all(0 <= s <= upper for s in samples)
     assert len(set(samples)) > 1  # actually random, not a fixed value
+
+
+def test_read_only_post_search_retries_preserve_body():
+    import json
+    from jobradar.http import request_data
+    t = RecordingTransport(httpx.Response(503), httpx.Response(200, json={'jobs': []}))
+    assert request_data(t.client(), URL, method='POST', json_body={'offset': 20}, sleep=lambda _: None) == {'jobs': []}
+    assert all(r.method == 'POST' and json.loads(r.content) == {'offset': 20} for r in t.requests)
+
+
+def test_text_feed_shares_retries_without_attempting_json_decode():
+    from jobradar.http import request_data
+    t = RecordingTransport(httpx.Response(429), httpx.Response(200, text='<workzag-jobs/>'))
+    assert request_data(t.client(), URL, as_text=True, sleep=lambda _: None) == '<workzag-jobs/>'

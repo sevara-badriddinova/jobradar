@@ -20,6 +20,7 @@ Telegram button press ──getUpdates──► feedback (APPLIED / IGNORED) + j
    It prints your chat id.
 4. `export TELEGRAM_CHAT_ID=<chat id>`, then
    `uv run jobradar telegram setup --test` sends a test message.
+5. Run `uv run jobradar telegram setup-menu` to add job lists to Telegram's Menu button.
 
 Tip: put both `export` lines in a `.env` file (already in `.gitignore`) and run
 `set -a; source .env; set +a` in each new terminal. The token is a password
@@ -38,38 +39,101 @@ If Applied or Not interested keeps loading, start `telegram listen` and leave
 it running. It processes pending clicks and saves new ones as they arrive.
 If credentials are in `.env`, load them first with `set -a; source .env; set +a`.
 
-Thresholds are in `profile.toml` under `[notifications]`. Each alert keeps these
-buttons, including after a choice is saved:
-- **Apply ↗** opens the posting.
-- **✅ Applied** marks the job `APPLIED`, so it's never suggested again.
-- **👎 Not interested** removes the role from your shortlist and suppresses further matching/alerts for it.
-- **📋 Add to queue** saves the role for later without marking it applied. Repeated clicks add nothing.
-- **🛂 Sponsorship required** skips this role because it cannot meet your sponsorship needs.
-  This records a role-specific reason, not a company-wide sponsorship judgment.
-- **Show queue** lists your selected open, unapplied roles, highest match percentage first.
+On macOS, install a background listener once so closing the terminal does not
+stop the buttons:
 
-The queue appears automatically after you decide on every role in the current
-notification list. Pending immediate alerts and in-flight sends count toward that list; failed
-and cancelled alerts, closed jobs, and applied jobs do not. `/queue` or `/done`
-shows the current queue at any time without discarding unreviewed roles.
-An unsent daily digest does not delay the current review list.
-Digest entries also have controls identified by the job IDs shown beside them.
-Match percentages reuse stored fit scores; they are not hiring probabilities.
-No email reads, Notion calls, or AI calls happen while reviewing.
+```bash
+.venv/bin/python deploy/install-telegram-listener.py
+```
 
-Selecting Add to queue can reverse an ignore/sponsorship choice. An existing
-application fact is preserved: applied, closed, or filtered roles cannot be
-added back to the active queue. Apply ↗ only opens the posting; use Applied to
-record that you submitted it.
+The login service reads this checkout's `.env`, starts at login, and restarts
+after an exit. Logs are in `.local/telegram-listener*.log`. It runs while your
+Mac is awake and you are logged in; an always-on host is needed for 24/7 handling.
+To stop and uninstall it, run `launchctl bootout gui/$(id -u)/com.jobradar.telegram-listener`
+and remove `~/Library/LaunchAgents/com.jobradar.telegram-listener.plist`.
 
-After upgrading, run `uv run jobradar init-db`, restart the listener, and use
-`uv run jobradar telegram refresh-buttons` to restore controls on existing messages.
-Sponsorship remains a global preference in `profile.toml`; it is already enabled
-for this profile. Unknown sponsorship is not treated as a confirmed refusal.
+Database configuration accepts `JOBRADAR_DATABASE_URL` first, then
+`DATABASE_URL_UNPOOLED`, then `DATABASE_URL`. The Neon direct URL is preferred
+for CLI workers and migrations. Temporary database disconnects are retried
+without losing the saved update offset.
+
+To also check job boards every 5 minutes and send eligible alerts, install the
+polling service:
+
+```bash
+.venv/bin/python deploy/install-telegram-listener.py --with-poller
+```
+
+It runs `collect → filter → match → notify --digest`, scoring at most 25 jobs
+per run when `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`) is present. Without
+the credential it still collects and filters jobs and sends previously scored
+matches, but new jobs cannot receive scores or alerts. `.env` is reloaded each
+run, so adding the credential does not require reinstalling. Polling logs are
+in `.local/poll*.log`. Stop it with
+`launchctl bootout gui/$(id -u)/com.jobradar.poll` and remove
+`~/Library/LaunchAgents/com.jobradar.poll.plist` to uninstall it.
+
+The button listener runs independently of collection and AI scoring. It uses
+short long-polls and bounded acknowledgment requests to recover promptly after
+network interruptions. Rapid clicks are saved and acknowledged before editing
+cards or delivering queue summaries.
+
+The current profile uses `delivery = "queue"` under `[notifications]`. All matches
+at or above `digest_min_score` appear in one persistent Telegram message. New
+matches update this message without sending another alert. `delivery = "alerts"`
+retains separate immediate/digest notifications, with the same interactive queue.
+
+Open Telegram's **Menu** button or send `/menu` to choose a list. The queue's
+**🏠 Main menu** button opens the same choices within the existing message:
+
+- **🆕 New** (`/new`): all unreviewed, open matches, highest score first.
+- **❤️ Liked** (`/liked`): jobs you saved for later (existing Add to queue choices are preserved).
+- **✅ Applied** (`/applied`): recorded applications, including rejected applications.
+- **⏭️ Skipped** (`/skipped`): Not interested and Sponsorship required choices.
+
+**Show queue**, **View all jobs**, and `/queue` still open New directly.
+
+Each page shows five jobs. Tap a job's company/title button to open its details,
+reasons, and concerns in the same message. **Like**, **Not interested**, **Mark
+applied**, and **Sponsorship required** save your choice immediately. **Open
+application** opens the posting; it does not claim you submitted an application.
+Use **⬅️ Back to jobs** to return to the list, or **🏠 Main menu** to change lists.
+Job lists and details show relative posting ages. Where Greenhouse supplies only
+an update timestamp, the label is **Updated**; without a source date, it is
+**First seen**, based on when JobRadar discovered the job. Job IDs and list
+numbering are hidden; internal identifiers still connect buttons to jobs.
+The current profile sets `[filters].max_posting_age_days = 3`: New and Liked
+require an actual publication date in the last 72 hours. Missing and future dates
+are excluded, and an update or discovery timestamp never substitutes for publication.
+The cutoff is checked before AI scoring and delivery, and existing jobs age out
+on subsequent scans or queue refreshes. Applied and Skipped remain review history.
+Run `jobradar init-db` when upgrading to correct legacy Greenhouse update timestamps,
+then `jobradar filter --recheck` to apply the rule to existing jobs.
+Pagination, refreshing, and reviewing update the same message. The current
+`delivery = "alerts"` setting sends new messages for qualifying matches; optional
+`delivery = "queue"` edits the queue without a fresh alert. Each new posting must
+explicitly offer visa sponsorship or STEM OPT support.
+
+A skipped job can be restored by liking it. An application fact is preserved:
+applied, rejected, or closed jobs cannot be returned to the active shortlist.
+Match percentages are stored fit scores, not hiring probabilities. Browsing and
+reviewing make no AI, email, or Notion calls.
+
+The message ID and current view survive listener restarts in `app_state`. On
+upgrade, the latest existing queue summary is reused. Earlier chat history is
+left intact. An edit timeout is retried against the same message; the bot does
+not send a replacement just because an edit timed out. If Telegram confirms the
+message was deleted, one replacement is created. An uncertain first send is
+not repeated automatically; `/queue` explicitly requests recovery.
+
+After upgrading, run `jobradar telegram setup-menu`, restart the listener, and use `jobradar telegram refresh-buttons`
+to replace old digest button grids with job-name selectors. Sponsorship remains
+a global preference in `profile.toml`; unknown sponsorship is not treated as a
+confirmed refusal.
 
 ## Decisions and why
 
-**The outbox pattern.** We never "send, then write down that we sent". A
+**Separate-alert mode: the outbox pattern.** We never "send, then write down that we sent". A
 `notifications` row is written first, and `UNIQUE(job_id, channel)` makes
 queueing idempotent: re-running `notify` can never queue a job twice. Each row
 then moves through `pending → sending → sent`, with the claim (`pending →
@@ -102,12 +166,12 @@ can't apply a press twice or lose one. Answering the button and editing the
 message happen afterwards and are cosmetic: if they fail (Telegram rejects
 answers to old button presses), the decision is still saved.
 
-A PostgreSQL advisory lock allows only one update consumer at a time, so
+A PostgreSQL transaction advisory lock allows only one update consumer at a time, so
 `notify` and `telegram listen` cannot race the saved offset. `job_reviews`
 stores one current choice per job, while `applications` preserves Applied
-facts for future role linking. A separate `review_responses` outbox saves the
-final queue with the triggering update. Uncertain summary delivery is not
-automatically retried; `/queue` retrieves it explicitly.
+facts for future role linking. The queue view is saved with the triggering update in `app_state`. Legacy
+`review_responses` rows are retained to locate the existing queue message.
+Uncertain first delivery is not automatically retried; `/queue` requests recovery.
 
 **Only your chat can press buttons.** Anyone can find a bot by its name, so a
 button press from any other chat id is ignored. Button data is validated
@@ -132,7 +196,8 @@ you to a dead link.
 
 ## How it runs today, and next
 
-`notify` is a one-shot command: button presses are picked up the next time it
-runs, or instantly with `telegram listen` running. The scheduler (plan step 5)
-will run `collect → filter → match → notify` every few minutes and the digest
-once a day, which is what makes this fully automatic.
+`notify` is a one-shot command. The installed macOS poller runs rotating batches
+of up to 100 boards, filters, matches, and sends alerts plus the digest every
+five minutes while the Mac is available. The listener handles buttons separately.
+See [matching and coverage policy](13-matching-and-coverage.md) for registry
+coverage, sponsorship evidence, and operational limits.

@@ -7,7 +7,9 @@ from jobradar.db import app_state, feedback, job_matches, jobs as jobs_t, notifi
 from jobradar.notifications import (
     MAX_ATTEMPTS, MAX_FAILURES_IN_A_ROW, enqueue, process_updates, resend_stuck, send_digest, send_immediate,
 )
-from jobradar.settings import NotificationSettings
+from jobradar.settings import NotificationSettings, Settings
+from jobradar.matcher import context_hash
+from jobradar.settings import Preferences
 from jobradar.telegram import Telegram
 from tests.factories import make_job
 from tests.fake_telegram import FakeTelegram
@@ -26,7 +28,9 @@ def matched(engine, scores: dict[str, float]):
         for sid, score in scores.items():
             job_id = row(engine, sid).id
             match_id = conn.execute(job_matches.insert().values(
-                job_id=job_id, profile_id=profile.id, context_hash="c", model="m", prompt_version="1",
+                job_id=job_id, profile_id=profile.id,
+                context_hash=context_hash(profile.id, Preferences(), row(engine, sid), profile.profile),
+                model="m", prompt_version="1",
                 assessment={"reasons": [f"why {sid}"], "concerns": [], "missing_skills": []},
                 score=score).returning(job_matches.c.id)).scalar_one()
             conn.execute(update(jobs_t).where(jobs_t.c.id == job_id).values(
@@ -250,6 +254,7 @@ class TestCli:
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", server.token)
         monkeypatch.setenv("TELEGRAM_CHAT_ID", CHAT)
         monkeypatch.setattr(cli, "make_client", server.client)
+        monkeypatch.setattr(cli, "load_settings", lambda path: Settings())
 
     def test_missing_config_explains_setup(self, engine, db_env, monkeypatch, capsys):
         monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)

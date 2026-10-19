@@ -1,0 +1,22 @@
+# Continuous multi-worker pipeline. Used together with compose.yaml:
+#   docker compose -f compose.yaml -f compose.workers.yaml run --rm --no-deps worker
+# Started only by jobradar-workers.service (never alongside jobradar-poll).
+services:
+  worker:
+    image: ${JOBRADAR_IMAGE:?Set an immutable image digest}
+    profiles: [workers]
+    env_file: runtime.env
+    init: true
+    command: [worker, --discover, --collect-concurrency, "4", --byte-budget-mb, "64"]
+    # Measured peak under load with a 78 MB board: ~320 MiB anonymous RSS.
+    mem_limit: 512m
+    memswap_limit: 1024m
+    stop_grace_period: 120s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+    depends_on:
+      postgres:
+        condition: service_healthy

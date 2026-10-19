@@ -10,6 +10,7 @@ class FakeTelegram:
     def __init__(self, token: str = "123:SECRET") -> None:
         self.token = token
         self.sent: list[dict[str, Any]] = []          # sendMessage payloads, in order
+        self.edited: list[dict[str, Any]] = []
         self.calls: list[tuple[str, dict]] = []       # (method, payload) for every request
         self.updates: list[dict[str, Any]] = []
         self.failures: dict[str, list[Any]] = {}      # method -> queued failures
@@ -54,6 +55,12 @@ class FakeTelegram:
     def _getMe(self, payload):
         return {"id": 1, "is_bot": True, "username": "jobradar_test_bot"}
 
+    def _setMyCommands(self, payload):
+        return True
+
+    def _setChatMenuButton(self, payload):
+        return True
+
     def _sendMessage(self, payload):
         self._next_message_id += 1
         self.sent.append(payload | {"message_id": self._next_message_id})
@@ -67,3 +74,7 @@ class FakeTelegram:
 
     def _editMessageReplyMarkup(self, payload):
         return True
+
+    def _editMessageText(self, payload):
+        self.edited.append(payload)
+        return {"message_id": payload["message_id"]}

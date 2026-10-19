@@ -1,21 +1,27 @@
 """Hard filters: cheap, deterministic rules that run before any AI.
 
-They reject only when confident. Missing a good job costs more than one extra
-AI call, so anything ambiguous ("Remote", no stated experience) passes through.
+Ambiguous role requirements ("Remote", no stated experience) pass through.
+An enabled posting-age cutoff requires a known publication date.
 """
 
 import logging
 import re
+import hashlib
+import json
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import case, func, select, update
+from sqlalchemy import and_, case, func, or_, select, true, update
 from sqlalchemy.engine import Connection
+from sqlalchemy.dialects.postgresql import insert
 
 from jobradar.collectors import COLLECTORS
-from jobradar.db import jobs
+from jobradar.db import jobs, app_state
 from jobradar.dedup import normalize_key
 from jobradar.settings import FilterSettings
+from jobradar.recency import publication_reason, recent_jobs
+from jobradar.query_fields import location_raw
 
 log = logging.getLogger(__name__)
 
@@ -100,8 +106,51 @@ _NO_SPONSORSHIP = re.compile("|".join([
 
 def sponsorship_reason(text: str) -> str | None:
     """Why a candidate who needs sponsorship can't take this job, or None."""
-    match = _NO_SPONSORSHIP.search(text)
-    return f"visa: \"{' '.join(match.group(0).split())}\"" if match else None
+    for match in _NO_SPONSORSHIP.finditer(text):
+        # Export-license sponsorship is not employment/visa sponsorship. Scope
+        # this exception to the object immediately following this match, never
+        # to the paragraph: a separate visa refusal must still win.
+        tail = text[match.end():]
+        if (re.search(r"\bsponsor(?:ship|ing)?$", match.group(0), re.I)
+                and re.match(r"\s+(?:for\s+)?(?:an?\s+)?export[- ]licen[cs]e\b", tail, re.I)
+                and not re.search(r"\b(?:visa|h-?1b|immigration|employment|work)\b", match.group(0), re.I)):
+            continue
+        return f"visa: \"{' '.join(match.group(0).split())}\""
+    return None
+
+
+def sponsorship_evidence(text: str) -> str | None:
+    """Return affirmative, role-local support wording, never employer history.
+
+    Conservative by design: questions, hypothetical availability, historical
+    claims, E-Verify alone, and negative/transfer-only statements do not qualify.
+    Explicit STEM OPT support qualifies separately from an H-1B promise.
+    """
+    flat = " ".join(text.split())
+    # Do not take the positive opening sentence of a conditional sponsorship
+    # paragraph in isolation (a common careers-page boilerplate pattern).
+    if re.search(r"\b(?:not|cannot|can't|aren't|aren’t|unable)\b[^.!?]{0,100}"
+                 r"\bsponsor(?:ship)?\b[^.!?]{0,70}\b(?:every|all|this)\s+(?:role|position|candidate)", flat, re.I):
+        return None
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", text):
+        sentence = " ".join(sentence.split())
+        if not sentence or "?" in sentence or sponsorship_reason(sentence):
+            continue
+        if re.search(r"\b(not|no|cannot|can't|unable|unavailable|historically|previously|may|might)\b|"
+                     r"\b(?:transfer|transfers|existing visa holders)\s+only\b|"
+                     r"\b(?:some|select|other|certain)\s+(?:roles|positions)\b|case.by.case|subject to|depending on",
+                     sentence, re.I):
+            continue
+        offer = (r"\b(?:we|the company|our company)\s+(?:will\s+|can\s+|do\s+)?"
+                 r"(?:offer|provide|support)\s+(?:employment[- ]based\s+|work\s+|immigration\s+|visa\s+|h-?1b\s+)+sponsorship\b"
+                 r"|\b(?:visa|h-?1b|immigration|employment)\s+sponsorship\s*:?\s*(?:is\s+)?(?:available|provided|offered|supported)\b"
+                 r"|\bthis\s+(?:role|position)\s+is\s+eligible\s+for\s+(?:h-?1b\s+)?visa\s+sponsorship\b"
+                 r"|\b(?:we\s+)(?:will\s+|can\s+|do\s+)?sponsor\s+(?:work\s+visas|visas|h-?1b|qualified\s+candidates|eligible\s+candidates)\b"
+                 r"|\b(?:offer|provide|support|welcome|accept)\s+(?:candidates\s+(?:on|with)\s+)?stem[ -]opt\b"
+                 r"|\bstem[ -]opt\s+(?:candidates\s+)?(?:are\s+)?(?:welcome|supported|accepted|eligible)\b")
+        if re.search(offer, sentence, re.I):
+            return sentence
+    return None
 
 
 # --- location -------------------------------------------------------------------
@@ -166,8 +215,11 @@ def location_reason(locations: list[str]) -> str | None:
 # --- putting it together ----------------------------------------------------------
 
 def reject_reason(*, source: str, title: str, location: str | None, description: str,
-                  raw: dict, settings: FilterSettings, needs_sponsorship: bool = False) -> str | None:
+                  raw: dict, settings: FilterSettings, needs_sponsorship: bool = False,
+                  posted_at=None) -> str | None:
     """Why this job should be rejected, or None if it passes every hard filter."""
+    if reason := publication_reason(posted_at, settings.max_posting_age_days):
+        return reason
     if reason := title_reason(title, settings):
         return reason
     years = required_years(description)
@@ -175,6 +227,8 @@ def reject_reason(*, source: str, title: str, location: str | None, description:
         return f"experience: requires {years}+ years"
     if needs_sponsorship and (reason := sponsorship_reason(description)):
         return reason
+    if settings.require_explicit_sponsorship and not sponsorship_evidence(description):
+        return "visa: no explicit sponsorship or STEM OPT support in this posting"
     if settings.us_only:
         extra = COLLECTORS[source].locations(raw) if source in COLLECTORS else []
         return location_reason([loc for loc in [location, *extra] if loc])
@@ -185,40 +239,100 @@ def reject_reason(*, source: str, title: str, location: str | None, description:
 class FilterResult:
     passed: int = 0
     rejected: Counter = field(default_factory=Counter)  # reason -> count
+    passed_ids: list[int] = field(default_factory=list)
 
 
 def run_filters(conn: Connection, settings: FilterSettings, *, recheck: bool = False,
-                needs_sponsorship: bool = False) -> FilterResult:
+                needs_sponsorship: bool = False, only_ids: list[int] | None = None) -> FilterResult:
     """Filter new canonical open jobs.
 
     recheck=True re-evaluates earlier decisions too (use it after changing
     [filters] or [preferences] in profile.toml): newly failing jobs, including
     already-matched ones that haven't been sent yet, become FILTERED, and
     previously filtered jobs that now pass go back to DISCOVERED.
+    An enabled posting-age cutoff is rechecked every run, including NOTIFIED
+    jobs, while application facts and review choices are retained.
     """
-    query = select(jobs.c.id, jobs.c.source, jobs.c.title, jobs.c.location, jobs.c.description,
-                   jobs.c.raw).where(jobs.c.closed_at.is_(None))
-    if recheck:
-        query = query.where(jobs.c.status.in_(["DISCOVERED", "FILTERED", "MATCHED"]))
-    else:
-        query = query.where(jobs.c.status == "DISCOVERED", jobs.c.filtered_at.is_(None))
-
+    signature = hashlib.sha256(json.dumps({"filters": settings.model_dump(),
+        "needs_sponsorship": needs_sponsorship, "version": 5}, sort_keys=True).encode()).hexdigest()
+    previous = conn.execute(select(app_state.c.value).where(app_state.c.key == "filter_context")).scalar_one_or_none()
+    recheck = recheck or previous != signature
     result = FilterResult()
+    statuses = ["DISCOVERED", "REPOSTED", "FILTERED", "MATCHED"]
+    if settings.max_posting_age_days is not None:
+        statuses.append("NOTIFIED")
+    active = and_(jobs.c.closed_at.is_(None), jobs.c.status.in_(statuses))
+    if only_ids is not None and not recheck:
+        # Queue workers: evaluate exactly the claimed jobs, as a recheck would
+        # (they were explicitly queued). A policy change still forces the full
+        # pass below, so every job sees the new rules exactly once.
+        active = and_(active, jobs.c.id.in_(list(only_ids)))
+        recheck = True
+    now = datetime.now(UTC)
+    if settings.max_posting_age_days is not None:
+        # Expiration changes with time, content eligibility does not. Reject
+        # expired/missing dates server-side without transferring any job bodies.
+        reasons = [
+            ("posting date: unavailable", jobs.c.posted_at.is_(None)),
+            ("posting date: in the future", jobs.c.posted_at > now),
+            (f"posting date: older than {settings.max_posting_age_days} days",
+             jobs.c.posted_at < now - timedelta(days=settings.max_posting_age_days)),
+        ]
+        # Once rejected for an old/missing date, a row needs no daily heap
+        # scan. Ingestion clears filtered_at after date/content changes, and
+        # policy changes deliberately recheck everything. Future dates remain
+        # eligible for the moving time window.
+        expiry_candidates = or_(jobs.c.filtered_at.is_(None), jobs.c.status != "FILTERED",
+            jobs.c.filter_reason.is_(None), jobs.c.filter_reason.not_like("posting date:%"),
+            jobs.c.filter_reason == "posting date: in the future")
+        for reason, predicate in reasons:
+            count = conn.execute(update(jobs).where(active, predicate,
+                true() if recheck else expiry_candidates,
+                or_(jobs.c.status != "FILTERED", jobs.c.filter_reason.is_distinct_from(reason),
+                    jobs.c.filtered_at.is_(None))).values(
+                    status="FILTERED", filter_reason=reason, filtered_at=func.now())).rowcount
+            if count:
+                result.rejected[reason] += count
+    pending = active if recheck else and_(active, or_(jobs.c.filtered_at.is_(None),
+        jobs.c.filter_reason == "posting date: in the future"))
+    pending = and_(pending, recent_jobs(settings.max_posting_age_days, now))
     decisions: dict[str | None, list[int]] = {}
-    for row in conn.execute(query):
-        reason = reject_reason(source=row.source, title=row.title, location=row.location,
-                               description=row.description, raw=row.raw, settings=settings,
-                               needs_sponsorship=needs_sponsorship)
-        decisions.setdefault(reason, []).append(row.id)
+    # Read small metadata first: excluded titles never need a description.
+    cursor = 0
+    while True:
+        rows = conn.execute(select(jobs.c.id, jobs.c.title).where(pending, jobs.c.id > cursor)
+                            .order_by(jobs.c.id).limit(250)).all()
+        if not rows:
+            break
+        cursor = rows[-1].id
+        body_ids = []
+        for row in rows:
+            reason = title_reason(row.title, settings)
+            if reason:
+                decisions.setdefault(reason, []).append(row.id)
+            else:
+                body_ids.append(row.id)
+        if body_ids:
+            query = select(jobs.c.id, jobs.c.source, jobs.c.title, jobs.c.location,
+                           jobs.c.description, location_raw(), jobs.c.posted_at).where(jobs.c.id.in_(body_ids))
+            for row in conn.execute(query):
+                reason = reject_reason(source=row.source, title=row.title, location=row.location,
+                    description=row.description, raw=row.raw, settings=settings,
+                    needs_sponsorship=needs_sponsorship, posted_at=row.posted_at)
+                decisions.setdefault(reason, []).append(row.id)
 
     for reason, ids in decisions.items():
         # Passing keeps MATCHED jobs matched; only FILTERED ones come back as DISCOVERED.
         status = case((jobs.c.status == "FILTERED", "DISCOVERED"), else_=jobs.c.status) if reason is None else "FILTERED"
-        conn.execute(update(jobs).where(jobs.c.id.in_(ids)).values(
-            status=status, filter_reason=reason, filtered_at=func.now()))
+        for start in range(0, len(ids), 500):
+            conn.execute(update(jobs).where(jobs.c.id.in_(ids[start:start + 500])).values(
+                status=status, filter_reason=reason, filtered_at=func.now()))
         if reason is None:
             result.passed = len(ids)
+            result.passed_ids = list(ids)
         else:
-            result.rejected[reason] = len(ids)
+            result.rejected[reason] += len(ids)
     log.info("filters: %d passed, %d rejected", result.passed, result.rejected.total())
+    conn.execute(insert(app_state).values(key="filter_context", value=signature)
+        .on_conflict_do_update(index_elements=[app_state.c.key], set_={"value": signature}))
     return result

@@ -21,7 +21,7 @@ from jobradar.dedup import company_key, normalize_key
 
 log = logging.getLogger(__name__)
 
-OPEN_STATUSES = ["DISCOVERED", "FILTERED", "MATCHED", "NOTIFIED"]  # still "not acted on"
+OPEN_STATUSES = ["DISCOVERED", "REPOSTED", "FILTERED", "MATCHED", "NOTIFIED"]  # still "not acted on"
 
 
 def record(conn: Connection, *, source: str, external_id: str, company: str, role: str | None,
@@ -101,7 +101,27 @@ def link_applications(conn: Connection) -> LinkResult:
     # never the stale job snapshot used to find title matches.
     apps = conn.execute(select(applications).where(applications.c.role.is_not(None))
                         .order_by(applications.c.id).with_for_update()).all()
-    grouped = _jobs_by_company(conn) if apps else {}
+    # Compare distinct employers once, then fetch only their job titles. Running
+    # the prefix comparison for every job/application pair is costly on a small
+    # VM. Materialization prevents PostgreSQL from inlining it back into that loop.
+    # Distinct job employers come from a recursive "loose index scan" over
+    # ix_jobs_company_key: one index probe per employer instead of a sequential
+    # scan of every job row (800k rows read ~100k heap pages on the VM).
+    first_key = (select(func.min(jobs.c.company_key).label("company_key"))
+                 .where(jobs.c.company_key > "").cte("job_company_keys", recursive=True))
+    later_jobs = jobs.alias("later_jobs")
+    next_key = select(func.min(later_jobs.c.company_key)).where(
+        later_jobs.c.company_key > first_key.c.company_key).scalar_subquery()
+    job_keys = first_key.union_all(select(next_key).where(first_key.c.company_key.is_not(None)))
+    app_keys = select(applications.c.company_key).where(
+        applications.c.role.is_not(None), applications.c.company_key != "").distinct().cte("application_company_keys")
+    relevant_company = select(app_keys.c.company_key).where(or_(
+        job_keys.c.company_key == app_keys.c.company_key,
+        func.starts_with(job_keys.c.company_key, app_keys.c.company_key + " "),
+        func.starts_with(app_keys.c.company_key, job_keys.c.company_key + " "))).exists()
+    relevant_keys = (select(job_keys.c.company_key).where(job_keys.c.company_key.is_not(None), relevant_company)
+                     .cte("relevant_company_keys").prefix_with("MATERIALIZED"))
+    grouped = _jobs_by_company(conn, jobs.c.company_key.in_(select(relevant_keys.c.company_key))) if apps else {}
     for app in apps:
         matches = [job for job in _same_company_jobs(grouped, app.company_key) if same_role(app.role, job.title)]
         if not matches:

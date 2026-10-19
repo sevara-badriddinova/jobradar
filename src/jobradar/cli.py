@@ -26,18 +26,21 @@ import json
 import logging
 import os
 import sys
+import httpx
 import time
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import OperationalError
 
 from jobradar.applications import link_applications, mark_applied_by_hand, unmatched
-from jobradar.candidate import ResumeError, active_profile, extract_and_store
+from jobradar.candidate import ResumeError, active_profile, extract_and_store, refresh_experience
 from jobradar.collectors import build_collector
 from jobradar.companies import (
     CompanyFileError, list_companies, load_company_file, matches, sync_companies,
 )
-from jobradar.db import applications, collector_runs, job_matches, jobs, make_engine, migrate
+from jobradar.db import app_state, applications, collector_runs, job_matches, jobs, make_engine, migrate
 from jobradar.filters import run_filters
 from jobradar.http import make_client
 from jobradar.inbox import InboxError, sync_inbox
@@ -46,6 +49,7 @@ from jobradar.llm import LLMError
 from jobradar.matcher import run_matching
 from jobradar.notifications import enqueue, process_updates, refresh_buttons, resend_stuck, send_digest, send_immediate
 from jobradar.review import not_skipped
+from jobradar.queue_ui import request_queue
 from jobradar.telegram import Telegram, TelegramError
 from jobradar.pipeline import run_all
 from jobradar.settings import SettingsError, load_settings
@@ -89,10 +93,44 @@ def cmd_companies_list(args) -> int:
     return 0
 
 
+def cmd_companies_discover(args) -> int:
+    from jobradar.discovery import SUPPORTED, refresh_directory
+    # Cloud Run starts with an ephemeral filesystem on each invocation. A
+    # local timestamp alone refreshed and resynced all 12k boards every scan.
+    engine = make_engine()
+    try:
+        with engine.connect() as conn:
+            cached = conn.execute(select(app_state.c.value).where(
+                app_state.c.key == "directory_sync")).scalar_one_or_none()
+        cached = json.loads(cached) if cached else None
+        if cached and not args.force and cached.get("collector_platforms") == sorted(SUPPORTED):
+            age = (datetime.now(UTC) - datetime.fromisoformat(cached["synced_at"])).total_seconds()
+            if 0 <= age < 86400:
+                print(f"directory already synced: {cached['registered_boards']} boards (daily refresh)")
+                return 0
+        with make_client() as client:
+            report = refresh_directory(client, args.file, force=args.force)
+        with engine.begin() as conn:
+            sync_companies(conn, load_company_file(args.file))
+            value = json.dumps(dict(synced_at=datetime.now(UTC).isoformat(),
+                collector_platforms=sorted(SUPPORTED), registered_boards=report["registered_boards"]))
+            conn.execute(insert(app_state).values(key="directory_sync", value=value)
+                .on_conflict_do_update(index_elements=[app_state.c.key], set_={"value": value}))
+    except (CompanyFileError, OSError, ValueError, httpx.HTTPError) as exc:
+        print(f"board discovery failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        engine.dispose()
+    print(f"registered {report['registered_boards']} boards; unsupported: "
+          f"{report['unsupported_directory_boards']}. Sponsorship is checked per posting.")
+    return 0
+
+
 def cmd_collect(args) -> int:
     engine = make_engine()
     with engine.connect() as conn:
-        targets = list_companies(conn, priority=args.priority, names=args.companies or None)
+        targets = list_companies(conn, priority=args.priority, names=args.companies or None,
+                                 **({"limit": args.limit} if args.limit else {}))
 
     if args.companies:
         missing = [n for n in args.companies if not any(matches(t, n) for t in targets)]
@@ -187,19 +225,28 @@ def cmd_profile_show(args) -> int:
 
 def cmd_match(args) -> int:
     try:
-        preferences = load_settings(args.profile).preferences
+        settings = load_settings(args.profile)
+        preferences = settings.preferences
     except SettingsError as exc:
         print(exc, file=sys.stderr)
         return 2
     engine = make_engine()
-    with engine.connect() as conn:
-        profile = active_profile(conn)
+    with engine.begin() as conn:
+        profile = refresh_experience(conn)
     if profile is None:
         print("no profile yet; run: jobradar profile extract path/to/resume.pdf", file=sys.stderr)
         return 2
     with engine.begin() as conn:  # never spend AI calls on roles you've applied to
         link_applications(conn)
-    result = run_matching(engine, profile, preferences, limit=args.limit, rematch=args.rematch)
+    from jobradar import llm
+    from jobradar.ai_budget import DailyBudgetMeter, budget_from_env
+    llm.set_meter(DailyBudgetMeter(engine, budget_from_env()))  # records spend; caps when configured
+    try:
+        result = run_matching(engine, profile, preferences, limit=args.limit, rematch=args.rematch,
+                              max_posting_age_days=settings.filters.max_posting_age_days)
+    except llm.BudgetExceeded as exc:
+        print(f"{exc}; remaining jobs stay queued for tomorrow", file=sys.stderr)
+        return 0
     print(f"assessed {result.assessed}, reused {result.cached} cached, failed {result.failed}")
     if result.aborted:
         print("stopped early after repeated failures (see the errors above)", file=sys.stderr)
@@ -251,9 +298,41 @@ def _telegram_env(need_chat: bool = True) -> tuple[str, str] | None:
     return token, chat_id
 
 
+def prepare_delivery(engine, chat_id, profile_settings) -> dict:
+    """Pre-delivery reconciliation shared by `notify` and the queue-mode worker."""
+    settings = profile_settings.notifications
+    max_age = profile_settings.filters.max_posting_age_days
+    with engine.begin() as conn:
+        link_applications(conn)  # roles you've applied to are never announced
+        run_filters(conn, profile_settings.filters,
+                    needs_sponsorship=profile_settings.preferences.needs_visa_sponsorship is True)
+        profile = refresh_experience(conn)
+        if profile is not None:
+            from jobradar.matcher import invalidate_stale_matches
+            invalidate_stale_matches(conn, profile, profile_settings.preferences)
+        queued = enqueue(conn, settings, max_posting_age_days=max_age)
+        if settings.delivery == "queue":
+            request_queue(conn, chat_id, min_score=settings.digest_min_score, publish=True,
+                          max_posting_age_days=max_age)
+        else:
+            request_queue(conn, chat_id, create=False, min_score=settings.digest_min_score, publish=False,
+                          max_posting_age_days=max_age)
+    return queued
+
+
+def deliver_queue_mode(engine, tg, chat_id, profile_settings) -> int:
+    """Queue (Mini App) delivery: one durable queue update, never per-job alerts."""
+    process_updates(engine, tg, chat_id)
+    queued = prepare_delivery(engine, chat_id, profile_settings)
+    process_updates(engine, tg, chat_id)
+    return queued["immediate"] + queued["digest"]
+
+
 def cmd_notify(args) -> int:
     try:
-        settings = load_settings(args.profile).notifications
+        profile_settings = load_settings(args.profile)
+        settings = profile_settings.notifications
+        max_age = profile_settings.filters.max_posting_age_days
     except SettingsError as exc:
         print(exc, file=sys.stderr)
         return 2
@@ -271,11 +350,18 @@ def cmd_notify(args) -> int:
         except TelegramError as exc:
             print(f"telegram: {exc}", file=sys.stderr)
             return 2
-        with engine.begin() as conn:
-            link_applications(conn)  # roles you've applied to are never announced
-            queued = enqueue(conn, settings)
-        sent = send_immediate(engine, tg, chat_id)
-        digest = send_digest(engine, tg, chat_id) if args.digest else None
+        queued = prepare_delivery(engine, chat_id, profile_settings)
+        if settings.delivery == "queue":
+            # The listener shares the consumer lock and will render this update
+            # if it owns the lock right now. Pending jobs remain durable.
+            process_updates(engine, tg, chat_id)
+            print(f"button presses applied: {pressed}")
+            print(f"queue update saved: {queued['immediate'] + queued['digest']} new job(s)")
+            return 0
+        policy = dict(max_posting_age_days=max_age,
+                      require_explicit_sponsorship=profile_settings.filters.require_explicit_sponsorship)
+        sent = send_immediate(engine, tg, chat_id, **policy)
+        digest = send_digest(engine, tg, chat_id, **policy) if args.digest else None
 
     print(f"button presses applied: {pressed}")
     print(f"queued: {queued['immediate']} immediate, {queued['digest']} for the digest")
@@ -324,21 +410,52 @@ def cmd_telegram_listen(args) -> int:
         return 2
     token, chat_id = env
     engine = make_engine()
+    try:
+        settings = load_settings(args.profile)
+    except SettingsError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    policy_ready = False
     print("listening for button presses (Ctrl-C to stop)")
     with make_client() as client:
         tg = Telegram(token, client)
         try:
             while True:
                 try:
-                    if pressed := process_updates(engine, tg, chat_id, timeout=25):
+                    if not policy_ready:
+                        with engine.begin() as conn:
+                            request_queue(conn, chat_id, max_posting_age_days=settings.filters.max_posting_age_days,
+                                          min_score=settings.notifications.digest_min_score)
+                        policy_ready = True
+                    if pressed := process_updates(engine, tg, chat_id, timeout=5):
                         print(f"applied {pressed} button press(es)")
                     else:
                         time.sleep(1)  # another listener may own the update-consumer lock
                 except TelegramError as exc:
-                    logging.getLogger(__name__).warning("telegram: %s; retrying in 5s", exc)
+                    logging.getLogger(__name__).warning("telegram: %s; retrying in 1s", exc)
+                    time.sleep(1)
+                except OperationalError:
+                    # A sleeping database or dropped connection must not kill
+                    # live buttons. Do not log URLs, SQL parameters, or secrets.
+                    logging.getLogger(__name__).warning("database unavailable; retrying in 5s")
+                    engine.dispose()
                     time.sleep(5)
         except KeyboardInterrupt:
             return 0
+
+
+def cmd_telegram_menu(args) -> int:
+    if (env := _telegram_env()) is None:
+        return 2
+    token, chat_id = env
+    with make_client() as client:
+        try:
+            Telegram(token, client).setup_menu(chat_id)
+        except TelegramError as exc:
+            print(f"telegram: {exc}", file=sys.stderr)
+            return 2
+    print("Telegram menu configured: New, Liked, Applied, Skipped")
+    return 0
 
 
 def cmd_telegram_refresh_buttons(args) -> int:
@@ -457,6 +574,98 @@ def cmd_new(args) -> int:
     return 0
 
 
+def cmd_worker(args) -> int:
+    """Run the continuous pipeline until SIGTERM (or --duration seconds)."""
+    import signal
+
+    from jobradar.cycle import cycle_lock
+    from jobradar.health import record_progress
+    from jobradar.worker import ALL_ROLES, Worker, WorkerConfig
+
+    roles = frozenset(r.strip() for r in args.roles.split(",") if r.strip())
+    if not roles <= ALL_ROLES:
+        print(f"unknown roles: {sorted(roles - ALL_ROLES)}", file=sys.stderr)
+        return 2
+    try:
+        load_settings(args.profile)
+    except SettingsError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    telegram = None
+    if "notify" in roles:
+        env = _telegram_env()
+        if env is None:
+            return 2
+        telegram = (Telegram(env[0], make_client()), env[1])
+    from jobradar.ai_budget import budget_from_env
+    budget = args.ai_daily_budget_usd if args.ai_daily_budget_usd is not None else budget_from_env()
+    config = WorkerConfig(roles=roles, collect_concurrency=args.collect_concurrency,
+                          base_interval=args.base_interval_minutes * 60,
+                          byte_budget=args.byte_budget_mb * 1024 * 1024,
+                          ai_daily_budget_usd=budget)
+    pool = config.collect_concurrency + 4
+    engine = make_engine(pool_size=pool, max_overflow=2, pool_timeout=60)
+
+    def discover():
+        main(["--profile", args.profile, "companies", "discover"])
+
+    try:
+        # Mutual exclusion with the legacy cycle: hold its lock for our lifetime.
+        with cycle_lock(engine) as acquired:
+            if not acquired:
+                print("a legacy cycle or another worker holds the pipeline lock; exiting", file=sys.stderr)
+                return 75
+            worker = Worker(engine, config, settings_loader=lambda: load_settings(args.profile),
+                            telegram=telegram, profile_path=args.profile,
+                            discover=discover if args.discover else None,
+                            heartbeat=record_progress)
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                signal.signal(sig, lambda *_: worker.stop.set())
+            worker.run(duration=args.duration)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    finally:
+        engine.dispose()
+    import threading
+    if any(t.is_alive() and not t.daemon for t in threading.enumerate() if t is not threading.main_thread()):
+        # A collection still finishing an HTTP page would hold the interpreter
+        # open past docker's grace period. Leases are already released and any
+        # open transaction rolls back when the connection drops.
+        logging.shutdown()
+        sys.stdout.flush()
+        os._exit(0)
+    return 0
+
+
+def cmd_metrics(args) -> int:
+    from jobradar.metrics import snapshot
+    with make_engine().connect() as conn:
+        print(json.dumps(snapshot(conn), indent=2, default=str, sort_keys=True))
+    return 0
+
+
+def cmd_requeue(args) -> int:
+    """Explicitly re-run a stage for some jobs, or make boards due now."""
+    from jobradar import queue
+    with make_engine().begin() as conn:
+        if args.stage == "boards":
+            n = queue.requeue_boards(conn, args.targets or None)
+            print(f"{n} board(s) due now")
+            return 0
+        if args.targets:
+            ids = [int(t) for t in args.targets]
+        elif args.stage == "filter":
+            ids = conn.execute(select(jobs.c.id).where(jobs.c.closed_at.is_(None),
+                jobs.c.filtered_at.is_(None))).scalars().all()
+        else:
+            ids = conn.execute(select(jobs.c.id).where(jobs.c.closed_at.is_(None),
+                jobs.c.status.in_(["DISCOVERED", "REPOSTED"]), jobs.c.filtered_at.is_not(None))).scalars().all()
+        n = queue.enqueue(conn, args.stage, ids, priority=50)
+    print(f"{n} {args.stage} task(s) queued")
+    return 0
+
+
 def cmd_runs(args) -> int:
     with make_engine().connect() as conn:
         rows = conn.execute(
@@ -505,11 +714,34 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("init-db", help="create or upgrade the database schema").set_defaults(func=cmd_init_db)
 
+    p = sub.add_parser("worker", help="run the continuous multi-worker pipeline (until SIGTERM)")
+    p.add_argument("--roles", default="schedule,collect,filter,match,notify")
+    p.add_argument("--collect-concurrency", type=positive_int, default=4)
+    p.add_argument("--ai-daily-budget-usd", type=float,
+                   help="pause matching (jobs stay queued) once today's UTC spend reaches this; "
+                        "default: $JOBRADAR_AI_DAILY_BUDGET_USD, else uncapped")
+    p.add_argument("--base-interval-minutes", type=positive_int, default=30,
+                   help="healthy board revisit interval, multiplied by its priority")
+    p.add_argument("--byte-budget-mb", type=positive_int, default=64)
+    p.add_argument("--discover", action="store_true", help="refresh the board directory hourly (daily-cached)")
+    p.add_argument("--duration", type=float, help="stop after this many seconds (trials)")
+    p.set_defaults(func=cmd_worker)
+
+    p = sub.add_parser("metrics", help="queue depth/age, failures, board coverage, alert latency (JSON)")
+    p.set_defaults(func=cmd_metrics)
+
+    p = sub.add_parser("requeue", help="explicitly queue jobs for a stage, or make boards due now")
+    p.add_argument("stage", choices=["filter", "match", "boards"])
+    p.add_argument("targets", nargs="*", help="job ids (filter/match) or board/company names (boards)")
+    p.set_defaults(func=cmd_requeue)
+
     p = sub.add_parser("cycle", help="run one scheduled collection/filter cycle, then exit")
     p.add_argument("--applications", choices=["none", "auto", "notion", "gmail", "all"], default="none")
     p.add_argument("--inbox-limit", type=positive_int, default=200)
     p.add_argument("--match", action="store_true", help="enable paid AI matching")
     p.add_argument("--match-limit", type=positive_int, default=25)
+    p.add_argument("--collect-limit", type=positive_int, help="rotate through this many least-recently polled boards")
+    p.add_argument("--discover", action="store_true", help="refresh the public board directory at most daily")
     p.add_argument("--notify", action="store_true", help="enable Telegram delivery")
     p.add_argument("--digest", action="store_true", help="include a digest on this cycle")
     p.set_defaults(func=cmd_cycle)
@@ -523,9 +755,14 @@ def main(argv: list[str] | None = None) -> int:
     p = csub.add_parser("list", help="show registered companies")
     p.add_argument("--all", action="store_true", help="include disabled companies")
     p.set_defaults(func=cmd_companies_list)
+    p = csub.add_parser("discover", help="expand the registry from public ATS board addresses")
+    p.add_argument("--file", default="companies.toml")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_companies_discover)
 
     p = sub.add_parser("collect", help="poll registered companies once")
     p.add_argument("companies", nargs="*", help="board or company names (default: all enabled)")
+    p.add_argument("--limit", type=positive_int, help="poll the least-recently attempted boards first")
     p.add_argument("--priority", type=int, choices=[1, 2, 3],
                    help="only companies at this priority or more important (1 = highest)")
     p.set_defaults(func=cmd_collect)
@@ -564,6 +801,7 @@ def main(argv: list[str] | None = None) -> int:
 
     telegram = sub.add_parser("telegram", help="Telegram setup and live button handling")
     tsub = telegram.add_subparsers(dest="telegram_command", required=True)
+    tsub.add_parser("setup-menu", help="configure Telegram's job navigation menu").set_defaults(func=cmd_telegram_menu)
     p = tsub.add_parser("setup", help="show the bot and the chat ids that messaged it")
     p.add_argument("--test", action="store_true", help="send a test message to TELEGRAM_CHAT_ID")
     p.set_defaults(func=cmd_telegram_setup)

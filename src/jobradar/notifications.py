@@ -13,6 +13,7 @@
 
 import html
 import logging
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -21,8 +22,11 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Connection, Engine, Row
 
 from jobradar.applications import record
-from jobradar.db import app_state, feedback, job_matches, job_reviews, jobs, notifications, review_responses
-from jobradar.review import not_skipped, remaining, save_summary, set_choice
+from jobradar.db import app_state, feedback, job_matches, job_reviews, jobs, notifications
+from jobradar.filters import sponsorship_evidence, sponsorship_reason
+from jobradar.recency import publication_reason, recent_jobs
+from jobradar.review import not_skipped, remaining, set_choice
+from jobradar.queue_ui import parse_callback, read_state, request_queue, sync_queue
 from jobradar.settings import NotificationSettings
 from jobradar.telegram import MAX_MESSAGE_CHARS, Buttons, Telegram, TelegramError
 
@@ -44,16 +48,30 @@ class SendResult:
 
 # --- 1. queue ------------------------------------------------------------------------
 
-def enqueue(conn: Connection, settings: NotificationSettings) -> dict[str, int]:
+def enqueue(conn: Connection, settings: NotificationSettings, *, max_posting_age_days=None) -> dict[str, int]:
     """Queue every open matched job scoring at least the digest threshold. Idempotent."""
     kind = case((jobs.c.match_score >= settings.immediate_min_score, "immediate"), else_="digest")
+    # Reconcile pending rows with current scores; a cancelled, never-attempted
+    # alert can become eligible after a corrected assessment. Sent/uncertain
+    # deliveries remain protected by their existing outbox identity.
+    conn.execute(update(notifications).where(notifications.c.job_id == jobs.c.id,
+        notifications.c.status == "pending",
+        jobs.c.match_score >= settings.digest_min_score).values(kind=kind))
+    conn.execute(update(notifications).where(notifications.c.job_id == jobs.c.id,
+        notifications.c.status == "pending",
+        jobs.c.match_score < settings.digest_min_score).values(status="cancelled"))
     queued = conn.execute(
         insert(notifications)
         .from_select(["job_id", "channel", "kind"],
                      select(jobs.c.id, literal(CHANNEL), kind)
                      .where(jobs.c.status == "MATCHED", jobs.c.closed_at.is_(None),
-                            jobs.c.match_score >= settings.digest_min_score, not_skipped()))
-        .on_conflict_do_nothing(constraint="uq_notifications_job_channel")
+                            jobs.c.match_score >= settings.digest_min_score, not_skipped(),
+                            recent_jobs(max_posting_age_days)))
+        .on_conflict_do_update(constraint="uq_notifications_job_channel",
+            set_={"status": "pending", "kind": case(
+                (select(jobs.c.match_score).where(jobs.c.id == notifications.c.job_id).scalar_subquery()
+                 >= settings.immediate_min_score, "immediate"), else_="digest"), "last_error": None},
+            where=(notifications.c.status == "cancelled") & (notifications.c.attempts == 0))
         .returning(notifications.c.kind)
     ).scalars().all()
     return {"immediate": queued.count("immediate"), "digest": queued.count("digest")}
@@ -64,7 +82,8 @@ def enqueue(conn: Connection, settings: NotificationSettings) -> dict[str, int]:
 def _job(conn: Connection, job_id: int) -> Row:
     return conn.execute(
         select(jobs.c.id, jobs.c.company, jobs.c.title, jobs.c.location, jobs.c.url,
-               jobs.c.first_seen_at, jobs.c.closed_at, jobs.c.status, jobs.c.match_score,
+               jobs.c.first_seen_at, jobs.c.posted_at, jobs.c.closed_at, jobs.c.status, jobs.c.match_score,
+               jobs.c.description,
                job_matches.c.assessment, job_reviews.c.choice)
         .outerjoin(job_matches, jobs.c.match_id == job_matches.c.id)
         .outerjoin(job_reviews, jobs.c.id == job_reviews.c.job_id)
@@ -88,7 +107,8 @@ def _mark_failed(conn: Connection, ids: list[int], error: TelegramError) -> None
         last_error=str(error)))
 
 
-def send_immediate(engine: Engine, tg: Telegram, chat_id: str, now: datetime | None = None) -> SendResult:
+def send_immediate(engine: Engine, tg: Telegram, chat_id: str, now: datetime | None = None, *,
+                   max_posting_age_days=None, require_explicit_sponsorship=False) -> SendResult:
     result, failures_in_a_row = SendResult(), 0
     with engine.connect() as conn:
         ids = conn.execute(select(notifications.c.id).where(
@@ -106,9 +126,9 @@ def send_immediate(engine: Engine, tg: Telegram, chat_id: str, now: datetime | N
             if claimed is None:
                 continue  # another process took it
             job = _job(conn, claimed)
-            if not _eligible(job):
+            if not _eligible(job, max_posting_age_days, require_explicit_sponsorship):
                 conn.execute(update(notifications).where(notifications.c.id == notification_id)
-                             .values(status="cancelled"))
+                             .values(status="cancelled", attempts=notifications.c.attempts - 1))
                 result.cancelled += 1
                 continue
         try:
@@ -133,7 +153,8 @@ def send_immediate(engine: Engine, tg: Telegram, chat_id: str, now: datetime | N
     return result
 
 
-def send_digest(engine: Engine, tg: Telegram, chat_id: str) -> SendResult:
+def send_digest(engine: Engine, tg: Telegram, chat_id: str, *, max_posting_age_days=None,
+                require_explicit_sponsorship=False) -> SendResult:
     """Send every pending digest notification, grouped into as few messages as possible."""
     result = SendResult()
     with engine.begin() as conn:
@@ -147,8 +168,9 @@ def send_digest(engine: Engine, tg: Telegram, chat_id: str) -> SendResult:
         items = []
         for row in claimed:
             job = _job(conn, row.job_id)
-            if not _eligible(job):
-                conn.execute(update(notifications).where(notifications.c.id == row.id).values(status="cancelled"))
+            if not _eligible(job, max_posting_age_days, require_explicit_sponsorship):
+                conn.execute(update(notifications).where(notifications.c.id == row.id).values(
+                    status="cancelled", attempts=notifications.c.attempts - 1))
                 result.cancelled += 1
             else:
                 items.append((row.id, job))
@@ -184,36 +206,37 @@ def resend_stuck(conn: Connection) -> int:
 FEEDBACK_ACTIONS = {"applied": ("APPLIED", "✅ Marked as applied"),
                     "ignored": ("IGNORED", "👎 Not interested"),
                     "sponsorship": ("SPONSORSHIP", "🛂 Skipped: sponsorship required"),
-                    "queue": ("QUEUED", "📋 Added to queue")}
+                    "queue": ("QUEUED", "♥ Liked")}
 CONSUMER_LOCK = 741863201
 
 
-def _eligible(job: Row) -> bool:
+def _eligible(job: Row, max_posting_age_days=None, require_explicit_sponsorship=False) -> bool:
     return (job.closed_at is None and job.status == "MATCHED"
-            and job.choice not in ("IGNORED", "SPONSORSHIP", "APPLIED"))
+            and job.choice not in ("IGNORED", "SPONSORSHIP", "APPLIED")
+            and publication_reason(job.posted_at, max_posting_age_days) is None
+            and (not require_explicit_sponsorship or (
+                sponsorship_evidence(job.description) is not None and sponsorship_reason(job.description) is None)))
 
 
 def process_updates(engine: Engine, tg: Telegram, chat_id: str, timeout: int = 0) -> int:
     """One update consumer at a time, including getUpdates and cosmetic replies."""
     with engine.connect() as consumer:
-        locked = consumer.execute(text("SELECT pg_try_advisory_lock(:key)"), {"key": CONSUMER_LOCK}).scalar_one()
-        consumer.commit()
+        # Keep the transaction open for the whole poll so PgBouncer pins the
+        # backend. A transaction lock is released even if processing fails.
+        locked = consumer.execute(text("SELECT pg_try_advisory_xact_lock(:key)"), {"key": CONSUMER_LOCK}).scalar_one()
         if not locked:
             return 0
-        try:
-            return _process_updates(engine, tg, chat_id, timeout)
-        finally:
-            consumer.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": CONSUMER_LOCK})
-            consumer.commit()
+        return _process_updates(engine, tg, chat_id, timeout)
 
 
 def _process_updates(engine: Engine, tg: Telegram, chat_id: str, timeout: int) -> int:
-    _send_review_responses(engine, tg, chat_id)
     with engine.connect() as conn:
         offset = int(conn.execute(select(app_state.c.value).where(app_state.c.key == OFFSET_KEY))
                      .scalar_one_or_none() or 0)
     applied = 0
+    edits: dict[int, int] = {}
     for upd in tg.get_updates(offset, timeout=timeout):
+        started = time.monotonic()
         # Telegram may redeliver an old update. Never repeat its state change or summary.
         if upd["update_id"] < offset:
             continue
@@ -221,10 +244,21 @@ def _process_updates(engine: Engine, tg: Telegram, chat_id: str, timeout: int) -
         from_us = query is not None and str((query.get("message") or {}).get("chat", {}).get("id")) == str(chat_id)
         own_message = message is not None and str(message.get("chat", {}).get("id")) == str(chat_id)
         command = (message.get("text") or "").split() if own_message else []
+        command_view = ({"/new": "new", "/liked": "liked", "/applied": "applied", "/skipped": "skipped",
+                         "/menu": "menu", "/start": "menu", "/queue": "new", "/done": "new"}
+                        .get(command[0].split("@")[0]) if command else None)
         show_queue = (from_us and query.get("data") == "show_queue") or (
-            bool(command) and command[0].split("@")[0] in ("/queue", "/done"))
+            command_view is not None)
+        navigation = parse_callback(query.get("data", "")) if from_us else None
         with engine.begin() as conn:
-            outcome = _apply_feedback(conn, query.get("data", "")) if from_us and not show_queue else None
+            outcome = None
+            if navigation:
+                action, selected_id, view, page = navigation
+                if action not in ("open", "list", "menu"):
+                    outcome = _apply_feedback(conn, f"{'queue' if action == 'like' else action}:{selected_id}")
+                request_queue(conn, chat_id, view=view, page=page, job_id=selected_id, explicit=True)
+            elif from_us and not show_queue:
+                outcome = _apply_feedback(conn, query.get("data", ""))
             finished = False
             if outcome is not None:
                 _, _, job_id, changed = outcome
@@ -233,31 +267,41 @@ def _process_updates(engine: Engine, tg: Telegram, chat_id: str, timeout: int) -
                     notifications.c.job_id == job_id, notifications.c.channel == CHANNEL,
                     notifications.c.status == "sent")).first() is not None
                 finished = changed and was_sent and remaining(conn) == 0
-            if show_queue or finished:
-                save_summary(conn, upd["update_id"])
+            if show_queue or (finished and not navigation):
+                request_queue(conn, chat_id, view=command_view or "new", page=0, explicit=show_queue)
+            elif outcome is not None and not navigation:
+                request_queue(conn, chat_id, create=False)
             offset = upd["update_id"] + 1
             conn.execute(insert(app_state).values(key=OFFSET_KEY, value=str(offset))
                          .on_conflict_do_update(index_elements=["key"], set_={"value": str(offset)}))
         if not from_us:
             continue
         if outcome is None:
-            label = ("Your queue is below" if show_queue else "Already recorded" if query.get("data") == "noop"
+            label = ("Queue updated" if show_queue or navigation else "Already recorded" if query.get("data") == "noop"
                      else "This button is no longer available")
         else:
             applied += 1
             label, _, job_id, _ = outcome
         try:  # the choice and any summary are already committed
             tg.answer_callback(query["id"], label)
+            log.info("button acknowledged in %.2fs: %s", time.monotonic() - started, label)
         except TelegramError as exc:
             log.info("could not answer button press (it may be too old): %s", exc)
-        if outcome is not None:
-            try:
-                with engine.connect() as conn:
-                    buttons = _message_buttons(conn, query["message"]["message_id"], job_id)
-                tg.edit_buttons(chat_id, query["message"]["message_id"], buttons)
-            except TelegramError as exc:
-                log.info("could not update the message buttons: %s", exc)
-    _send_review_responses(engine, tg, chat_id)
+        if outcome is not None and not navigation:
+            with engine.connect() as conn:
+                state = read_state(conn, chat_id)
+            if not state or state.get("message_id") != query["message"]["message_id"]:
+                edits[query["message"]["message_id"]] = job_id
+    # Save and acknowledge every click before cosmetic requests. Coalesce rapid
+    # clicks on the same card/digest into one edit reflecting its final state.
+    for message_id, job_id in edits.items():
+        try:
+            with engine.connect() as conn:
+                buttons = _message_buttons(conn, message_id, job_id)
+            tg.edit_buttons(chat_id, message_id, buttons)
+        except TelegramError as exc:
+            log.info("could not update the message buttons: %s", exc)
+    sync_queue(engine, tg, chat_id)
     return applied
 
 
@@ -302,11 +346,14 @@ def _message_buttons(conn: Connection, message_id: int, fallback_job_id: int | N
 def refresh_buttons(engine: Engine, tg: Telegram, chat_id: str) -> int:
     """Restore current controls on existing sent cards, without resending alerts."""
     with engine.connect() as conn:
+        state = read_state(conn, chat_id)
         message_ids = conn.execute(select(notifications.c.message_id).where(
             notifications.c.channel == CHANNEL, notifications.c.status == "sent",
             notifications.c.message_id.is_not(None)).distinct()).scalars().all()
     refreshed = 0
     for message_id in message_ids:
+        if state and message_id == state.get("message_id"):
+            continue
         with engine.connect() as conn:
             buttons = _message_buttons(conn, message_id)
         try:
@@ -316,28 +363,6 @@ def refresh_buttons(engine: Engine, tg: Telegram, chat_id: str) -> int:
             if "message is not modified" not in str(exc):
                 raise
     return refreshed
-
-
-def _send_review_responses(engine: Engine, tg: Telegram, chat_id: str) -> None:
-    with engine.connect() as conn:
-        pending = conn.execute(select(review_responses).where(review_responses.c.status == "pending")
-                               .order_by(review_responses.c.update_id, review_responses.c.part)).all()
-    for response in pending:
-        key = (review_responses.c.update_id == response.update_id, review_responses.c.part == response.part)
-        with engine.begin() as conn:
-            claimed = conn.execute(update(review_responses).where(*key, review_responses.c.status == "pending")
-                                   .values(status="sending")).rowcount
-        if not claimed:
-            continue
-        try:
-            message_id = tg.send_message(chat_id, response.body, [[{"text": "Refresh queue", "callback_data": "show_queue"}]])
-        except TelegramError as exc:
-            with engine.begin() as conn:
-                conn.execute(update(review_responses).where(*key).values(status="sending" if exc.maybe_delivered else "failed"))
-            log.warning("queue summary delivery failed; use /queue to retrieve it: %s", exc)
-        else:
-            with engine.begin() as conn:
-                conn.execute(update(review_responses).where(*key).values(status="sent", message_id=message_id))
 
 
 # --- formatting ----------------------------------------------------------------------
@@ -365,6 +390,10 @@ def job_message(job: Row, now: datetime | None = None) -> str:
         f"{e(job.company)} · {e(job.location or 'location not listed')}",
         f"<i>found {_ago(job.first_seen_at, now or datetime.now(UTC))}</i>",
     ]
+    if getattr(job, "posted_at", None):
+        lines.append(f"Published: {job.posted_at:%Y-%m-%d %H:%M UTC}")
+    if evidence := sponsorship_evidence(getattr(job, "description", "")):
+        lines.append(f"🛂 Posting says: {e(_clip(evidence, 300))}")
     for heading, items in (("Why", a.get("reasons")), ("Concerns", a.get("concerns"))):
         if items:
             lines += ["", f"<b>{heading}</b>", *(f"• {e(_clip(item))}" for item in items[:4])]
@@ -388,18 +417,9 @@ def job_buttons(job: Row) -> Buttons:
 
 
 def digest_buttons(selected: list[Row]) -> Buttons:
-    rows = []
-    for job in selected:
-        choice = getattr(job, "choice", None)
-        rows.append([
-            {"text": f"{'✓' if choice == 'QUEUED' else '+'} Queue #{job.id}", "callback_data": f"queue:{job.id}"},
-            {"text": f"{'✓' if choice == 'IGNORED' else '👎'} Skip #{job.id}", "callback_data": f"ignored:{job.id}"},
-        ])
-        rows.append([
-            {"text": f"Sponsorship #{job.id}", "callback_data": f"sponsorship:{job.id}"},
-            {"text": f"Applied #{job.id}", "callback_data": f"applied:{job.id}"},
-        ])
-    return rows + [[{"text": "Show queue", "callback_data": "show_queue"}]]
+    return [[{"text": _clip(f"{job.company} — {job.title}", 65),
+              "callback_data": f"q:open:{job.id}:new:0"}] for job in selected] + [
+        [{"text": "View all jobs", "callback_data": "show_queue"}]]
 
 
 def digest_messages(items: list[tuple[int, Row]]) -> list[tuple[str, list[tuple[int, Row]]]]:
@@ -410,7 +430,11 @@ def digest_messages(items: list[tuple[int, Row]]) -> list[tuple[str, list[tuple[
     for item in items:
         job = item[1]
         title = f'<a href="{e(job.url)}">{e(_clip(job.title, 120))}</a>' if _is_web_url(job.url) else e(job.title)
-        line = f"<b>{float(job.match_score):.0f}%</b> · {title}\n     {e(job.company)} · {e(job.location or '-')} · #{job.id}"
+        line = f"<b>{float(job.match_score):.0f}%</b> · {title}\n     {e(job.company)} · {e(job.location or '-')}"
+        if getattr(job, "posted_at", None):
+            line += f"\n     Published: {job.posted_at:%Y-%m-%d %H:%M UTC}"
+        if evidence := sponsorship_evidence(getattr(job, "description", "")):
+            line += f"\n     🛂 {e(_clip(evidence, 180))}"
         if chunk and (len(chunk) >= 10 or len("\n\n".join([header, *lines, line])) > MAX_MESSAGE_CHARS - 100):
             messages.append(("\n\n".join([header, *lines]), chunk))
             lines, chunk = [], []

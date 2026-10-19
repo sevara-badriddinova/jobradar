@@ -42,7 +42,14 @@ def engine(_schema_engine):
 
 
 @pytest.fixture
-def db_env(monkeypatch, database_url):
+def db_env(monkeypatch, database_url, tmp_path):
     """Point the app's own config (used by the CLI) at the test database."""
     monkeypatch.setenv("JOBRADAR_DATABASE_URL", database_url)
+    # CLI behavior tests must not inherit the user's live freshness/sponsorship
+    # policy. Policy-specific tests supply their own Settings or explicit file.
+    from jobradar import cli
+    original = cli.load_settings
+    empty = tmp_path / "test-profile.toml"
+    empty.write_text("")
+    monkeypatch.setattr(cli, "load_settings", lambda path: original(empty if path == "profile.toml" else path))
     return database_url

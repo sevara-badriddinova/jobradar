@@ -35,6 +35,22 @@ def seed(engine):
 
 
 class TestLinking:
+    def test_company_prefixes_in_both_directions_preserve_word_boundaries(self, engine):
+        ingest(engine, [
+            make_job("short", company="Acme", title="Software Engineer"),
+            make_job("long", company="Acme Research Labs", title="Software Engineer"),
+            make_job("boundary", company="Acme Researcher", title="Software Engineer"),
+            make_job("unrelated", company="Other", title="Software Engineer"),
+        ])
+        add(engine, company="Acme Research", role="Software Engineer")
+        add(engine, external_id="duplicate", company="Acme Research", role="Software Engineer")
+        assert link(engine).jobs_marked == 2
+        assert row(engine, "short").status == "APPLIED"
+        assert row(engine, "long").status == "APPLIED"
+        assert row(engine, "boundary").status == "DISCOVERED"
+        assert row(engine, "unrelated").status == "DISCOVERED"
+        assert link(engine).jobs_marked == 0
+
     def test_marks_the_same_role_at_the_same_company_only(self, engine):
         seed(engine)
         add(engine, role="Software Engineer, New Grad (Dec 2026)")

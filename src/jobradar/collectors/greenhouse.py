@@ -35,8 +35,7 @@ class GreenhouseCollector(JobCollector):
             location=location.get("name") if isinstance(location, dict) else None,
             url=raw["absolute_url"],
             description=html_to_text(raw.get("content")),
-            posted_at=(parse_iso_datetime(raw.get("first_published"))
-                       or parse_iso_datetime(raw.get("updated_at"))),
+            posted_at=parse_iso_datetime(raw.get("first_published")),
             raw=raw,
         )
 

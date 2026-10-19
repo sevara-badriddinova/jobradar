@@ -118,3 +118,32 @@ def test_companies_sync_with_invalid_file_never_touches_db(monkeypatch, tmp_path
 def test_companies_sync_missing_file(capsys, tmp_path):
     assert cli.main(["companies", "sync", str(tmp_path / "missing.toml")]) == 2
     assert "file not found" in capsys.readouterr().err
+
+
+def test_listener_recovers_after_database_disconnect(monkeypatch, caplog):
+    from sqlalchemy.exc import OperationalError
+
+    state = {"polls": 0, "disposed": 0, "sleeps": []}
+    class Engine:
+        def begin(self):
+            from contextlib import nullcontext
+            return nullcontext(None)
+
+        def dispose(self):
+            state["disposed"] += 1
+
+    def poll(*args, **kwargs):
+        state["polls"] += 1
+        if state["polls"] == 1:
+            raise OperationalError("private SQL", {}, Exception("private credentials"))
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "_telegram_env", lambda: ("token", "chat"))
+    monkeypatch.setattr(cli, "make_engine", Engine)
+    monkeypatch.setattr(cli, "process_updates", poll)
+    monkeypatch.setattr(cli, "request_queue", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli.time, "sleep", state["sleeps"].append)
+    assert cli.main(["telegram", "listen"]) == 0
+    assert state == {"polls": 2, "disposed": 1, "sleeps": [5]}
+    assert "database unavailable" in caplog.text
+    assert "private" not in caplog.text

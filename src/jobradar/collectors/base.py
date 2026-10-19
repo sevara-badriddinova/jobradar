@@ -6,7 +6,7 @@ from typing import Any, ClassVar
 import httpx
 from pydantic import ValidationError
 
-from jobradar.http import FetchError, get_json, make_client
+from jobradar.http import FetchError, get_json, make_client, request_data
 from jobradar.models import Job
 
 log = logging.getLogger(__name__)
@@ -89,11 +89,13 @@ class JobCollector(ABC):
             # Record-level failure isolation: one malformed posting is logged
             # and skipped rather than failing the whole board.
             if not isinstance(raw, dict):
+                self.complete_snapshot = False
                 log.warning("%s/%s: skipping non-object job entry %r", self.source, self.board, raw)
                 continue
             try:
                 jobs.append(self.normalize(raw))
             except (KeyError, TypeError, ValueError, AttributeError, ValidationError) as exc:
+                self.complete_snapshot = False
                 log.warning("%s/%s: skipping malformed job %r: %s",
                             self.source, self.board, raw.get("id"), exc)
         if records and not jobs:
@@ -102,3 +104,14 @@ class JobCollector(ABC):
             # otherwise every job would be wrongly marked closed.
             raise CollectorError(f"could not normalize any of {len(records)} jobs")
         return jobs
+
+    def fetch_data(self, url: str, **kwargs: Any) -> Any:
+        """Retried read-only POST searches and text/XML feeds, with client reuse."""
+        client = self._client or make_client()
+        try:
+            return request_data(client, url, **kwargs)
+        except FetchError as exc:
+            raise CollectorError(str(exc)) from exc
+        finally:
+            if client is not self._client:
+                client.close()

@@ -37,9 +37,9 @@ class TestFieldMapping:
         (job,), _ = collect(ok(greenhouse_job(1)))
         assert job.posted_at.isoformat() == "2026-09-30T09:00:00-04:00"
 
-    def test_posted_at_falls_back_to_updated_at_and_parses_z(self):
+    def test_updated_at_does_not_count_as_publication(self):
         (job,), _ = collect(ok(greenhouse_job(1, first_published=None, updated_at="2026-10-02T12:00:00Z")))
-        assert job.posted_at.isoformat() == "2026-10-02T12:00:00+00:00"
+        assert job.posted_at is None
 
     def test_unparseable_timestamps_become_none(self):
         (job,), _ = collect(ok(greenhouse_job(1, first_published="yesterday", updated_at=12345)))

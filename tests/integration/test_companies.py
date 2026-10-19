@@ -105,6 +105,33 @@ class TestSchema:
             self.insert(engine, **kw)
 
 
+@pytest.mark.parametrize("fail_fetches", [False, True])
+def test_three_fifty_board_cycles_rotate_across_fresh_connections(engine, fail_fetches):
+    from jobradar.collectors.base import CollectorError
+    from jobradar.pipeline import run_all
+    from tests.integration.test_pipeline import Fake
+
+    sync(engine, [spec(f"Company {i:03}", board=f"c{i:03}") for i in range(150)])
+    batches = []
+    for _ in range(3):
+        # A cold worker must use durable attempt history, not an in-memory cache.
+        engine.dispose()
+        selected = rows(engine, limit=50)
+        boards = {c.board for c in selected}
+        assert len(boards) == 50
+        assert all(boards.isdisjoint(previous) for previous in batches)
+        reports = run_all(engine, [Fake(c.board,
+            error=CollectorError("source unavailable") if fail_fetches else None)
+            for c in selected])
+        assert all(report.ok is (not fail_fetches) for report in reports)
+        batches.append(boards)
+
+    assert len(set.union(*batches)) == 150
+    engine.dispose()
+    # Only after every board was attempted may the oldest batch repeat.
+    assert {c.board for c in rows(engine, limit=50)} == batches[0]
+
+
 class TestCli:
     def test_sync_dry_run_writes_nothing(self, engine, db_env, tmp_path, capsys):
         f = tmp_path / "c.toml"

@@ -1,5 +1,13 @@
 # jobradar
 
+**Current runtime (October 16, 2026):** Google Cloud `jobradar-vm`, an `e2-micro`
+with PostgreSQL 16 and the Telegram listener. A five-minute timer rotates through
+50 boards per cycle; private backups run daily. Independent cloud health checks
+run every 15 minutes. The Mac can be off: its workers and database are stopped.
+Neon remains quota-blocked; no Neon upgrade was purchased. See the
+[VM setup and verification](docs/18-google-vm.md) for costs, recovery, and the
+limitation on reconciling Neon-only history.
+
 A job discovery and matching pipeline for a new-grad SWE search. It polls company
 career boards, persists every posting in PostgreSQL, and decides *deterministically*
 what is genuinely new. AI is used only later, for matching.
@@ -10,7 +18,7 @@ Live Notion setup requires your tracker ID, property mapping, and token.
 Cloud Run Jobs + Cloud Scheduler deployment and a one-cycle command are available.
 Per-board polling intervals and per-host rate limiting are not implemented.**
 
-For unattended cloud polling with Neon PostgreSQL, follow the
+For the older cloud deployment with Neon PostgreSQL, see the
 [Cloud Run + Scheduler + Neon setup guide](docs/12-cloud-run.md). It includes a
 container, secret storage helper, deployment script, and overlap protection.
 The default scheduled cycle collects and filters; AI matching and alerts are optional.
@@ -82,12 +90,28 @@ uv run jobradar telegram listen   # keep running to respond to Applied / Not int
 `telegram listen` running in a separate terminal. Otherwise clicks wait until
 the next `notify` run and Telegram's loading indicator may time out.
 
-Use **Add to queue** to shortlist roles, **Not interested** or **Sponsorship
-required** to skip, and **Applied** after submitting. The bot shows your queue
-sorted by saved match percentage when the review list is finished. **Show
-queue** (or `/queue` in Telegram) opens it at any time. Controls remain visible
-after a choice. Run `jobradar init-db` after upgrading, restart the listener,
-then `jobradar telegram refresh-buttons` to update existing cards.
+The current profile sends **new Telegram alerts** for qualifying matches and retains
+**one editable queue message** for browsing. Open
+Telegram's **Menu** button or `/menu`, choose **🆕 New / ❤️ Liked / ✅ Applied / ⏭️ Skipped**, and tap a
+job by name. Its details and **Like**, **Not interested**, **Mark applied**, and
+**Sponsorship required** actions appear in the same message. **Open application**
+opens the posting without marking it applied. Pagination, choices, and new
+matches update the existing queue instead of adding more messages.
+Use **🏠 Main menu** to switch lists and **⬅️ Back to jobs** to leave a job's details.
+Jobs show their posting age, or **Updated** / **First seen** when an original
+posting date is unavailable in review history. The current profile requires a
+known posting date within the last **72 hours** for new and liked jobs, AI scoring,
+and notifications. Each posting must explicitly offer visa sponsorship or STEM OPT
+support; company history, E-Verify alone, and silence do not qualify.
+Updates and discovery dates do not qualify. Applied and skipped
+history is retained. Run `jobradar telegram setup-menu` once to configure
+Telegram's menu shortcuts.
+
+On macOS, `.venv/bin/python deploy/install-telegram-listener.py --with-poller`
+installs the background listener and five-minute scans of up to 100 boards per cycle,
+rotating least-recently attempted boards first. The public board directory is refreshed
+daily. This requires the Mac, local database, and network to be available. See
+[Telegram setup](docs/08-telegram.md) for credentials, limits, and operation.
 
 Never see a role you've already applied to (one-time setup: `docs/09-applications.md`):
 
@@ -106,7 +130,13 @@ a sync preserves source IDs and skips already-processed emails.
 
 The loop is: `collect` → `applications sync` → `filter` → `match` → `notify`.
 
-To watch another company, add it to `companies.toml` and run
+Run `jobradar companies discover` to expand the registry from the public ATS directory.
+`companies.coverage.json` records the source, counts, and unsupported platforms. The
+directory supplies addresses, not sponsorship verification, and is not a complete
+list of every employer. Current collectors cover Greenhouse, Ashby, Lever (including EU-hosted boards),
+Workday, Workable, Recruitee, Rippling, and Personio: 12,237 directory boards.
+See [public ATS collectors](docs/14-public-ats-collectors.md) for date handling,
+board token formats, and coverage limits. To watch another company, add it to `companies.toml` and run
 `jobradar companies sync companies.toml` again. The board is the slug in the
 company's careers URL: `boards.greenhouse.io/<board>` (Greenhouse),
 `jobs.lever.co/<board>` (Lever) or `jobs.ashbyhq.com/<board>` (Ashby).
@@ -116,7 +146,14 @@ Other ways to collect:
 ```bash
 uv run jobradar collect stripe figma        # specific companies (board or name)
 uv run jobradar collect --priority 1        # only the most important
+uv run jobradar collect --limit 100         # rotate through least-recently polled boards
 ```
+
+The October 13 matching fixes count full-time work before graduation, review hard
+AI rejections against quoted requirements, invalidate outdated assessments, and
+process reposts while retaining application suppression. See
+[matching and coverage policy](docs/13-matching-and-coverage.md) for the rationale,
+limits, and operating commands.
 
 ## Tests
 
@@ -146,7 +183,7 @@ and advisory locks are what's under test.
 | Path | Responsibility |
 |---|---|
 | `src/jobradar/models.py` | `Job`, the one normalized representation |
-| `src/jobradar/collectors/` | `JobCollector` base (shared HTTP/error handling) + `GreenhouseCollector`, `LeverCollector`, `AshbyCollector` |
+| `src/jobradar/collectors/` | `JobCollector` base (shared HTTP/error handling) and eight public ATS collectors |
 | `src/jobradar/http.py` | GET with retries, exponential backoff, jitter, `Retry-After` |
 | `src/jobradar/text.py` | HTML → plain text (stdlib only) |
 | `src/jobradar/dedup.py` | Pure identity keys: canonical URL, fingerprint, description hash |
@@ -185,7 +222,7 @@ slice numbers in `docs/`. Checked means implemented, not free of known gaps.
 - [x] 8. AI assessments, deterministic scoring, and context caching.
 - [x] 9. Telegram alerts, digest command, outbox, and feedback buttons.
 - [x] 10. Application tracking: Notion, Gmail, and manual inputs; live Notion setup still required.
-- [ ] 11. Custom collectors, selected from actual coverage gaps.
+- [x] 11. Workday, Workable, Recruitee, Rippling, and Personio public collectors.
 - [ ] 12. Semantic repost detection (L4), pending evaluation data.
 - [ ] 13. Queue/workers, deferred until measured throughput needs them.
 - [ ] 14. Metrics beyond the existing collector run log.

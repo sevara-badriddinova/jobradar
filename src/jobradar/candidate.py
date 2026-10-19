@@ -19,7 +19,7 @@ from jobradar import llm
 from jobradar.db import candidate_profiles
 
 # Bump when SYSTEM or CandidateProfile changes, so `profile extract` re-runs.
-PROMPT_VERSION = "1"
+PROMPT_VERSION = "2"
 DEFAULT_MODEL = "claude-sonnet-5-5"  # a one-off call: worth the stronger model
 
 
@@ -55,7 +55,7 @@ class CandidateProfile(BaseModel):
     graduation: str | None = Field(description="YYYY-MM of the most recent (or expected) degree")
     experience_level: Literal["student", "new_grad", "early_career", "mid", "senior"]
     years_of_experience: float = Field(
-        description="full-time professional experience after graduation; internships count as 0")
+        description="full-time professional experience, including before graduation; internships counted separately")
     languages: list[str]
     frameworks: list[str]
     databases: list[str]
@@ -71,8 +71,9 @@ Rules:
 - Use only facts stated in the resume. Don't guess or embellish; leave lists empty when unknown.
 - Leave out contact details and identity: no name, email, phone, address or links.
 - Dates are YYYY-MM.
-- years_of_experience counts only full-time work after graduation; internships, part-time,
-  research and teaching count as 0.
+- Include full-time employment before graduation. Graduation does not erase employment.
+- years_of_experience counts full-time employment; internships, part-time, research and
+  teaching are recorded in work_experience but not added to the full-time total.
 - experience_level: "student" if graduating in more than about 6 months, "new_grad" if graduating
   within 6 months or graduated less than a year ago, then "early_career" for up to ~3 years of
   experience, "mid" for ~3-7, "senior" beyond.
@@ -96,11 +97,50 @@ def read_resume(path: str | Path) -> str:
 
 
 def extract_profile(resume_text: str) -> CandidateProfile:
-    return llm.ask(
+    profile = llm.ask(
         CandidateProfile, system=SYSTEM,
         prompt=f"Today is {date.today().isoformat()}.\n\n<resume>\n{resume_text}\n</resume>",
         model=model_name(),
     )
+    return CandidateProfile.model_validate(normalize_experience(profile.model_dump(mode="json")))
+
+
+def normalize_experience(profile: dict, today: date | None = None) -> dict:
+    """Derive completed full-time months; overlapping jobs never double-count.
+
+    Month-only dates use [start, end), a conservative duration. Unknown dates
+    are not invented; their work records remain available to the matcher.
+    """
+    today = today or date.today()
+    current = today.year * 12 + today.month
+    months: set[int] = set()
+    for work in profile.get("work_experience", []):
+        if work.get("kind") != "full_time":
+            continue
+        try:
+            def month(value):
+                parsed = date.fromisoformat(value + "-01")
+                return parsed.year * 12 + parsed.month
+            start = month(work.get("start"))
+            end = current if str(work.get("end")).lower() == "present" else month(work.get("end"))
+        except (ValueError, TypeError):
+            continue
+        months.update(range(start, min(end, current)))
+    return {**profile, "years_of_experience": round(len(months) / 12, 2)}
+
+
+def refresh_experience(conn: Connection) -> Row | None:
+    """Version a correction to stored facts, without another paid extraction."""
+    current = active_profile(conn)
+    if current is None:
+        return None
+    normalized = normalize_experience(current.profile)
+    if normalized == current.profile:
+        return current
+    return conn.execute(insert(candidate_profiles).values(
+        resume_sha256=current.resume_sha256, prompt_version=current.prompt_version,
+        model=current.model, profile=normalized,
+    ).returning(candidate_profiles)).one()
 
 
 def model_name() -> str:

@@ -11,12 +11,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Connection, Row
 
 from jobradar.collectors import COLLECTORS
-from jobradar.db import companies as companies_t
+from jobradar.db import companies as companies_t, collector_runs
 from jobradar.dedup import company_key
 
 
@@ -59,6 +59,8 @@ class CompanySpec(BaseModel):
 
 
 def parse_companies(data: dict) -> list[CompanySpec]:
+    if data and set(data) != {"company"}:
+        raise CompanyFileError("expected only [[company]] entries; refusing an ambiguous registry")
     entries = data.get("company", [])
     if not isinstance(entries, list):
         raise CompanyFileError("expected [[company]] entries")
@@ -142,17 +144,28 @@ def matches(row: Row, name: str) -> bool:
 
 
 def list_companies(conn: Connection, *, enabled_only: bool = True,
-                   priority: int | None = None, names: list[str] | None = None) -> list[Row]:
+                   priority: int | None = None, names: list[str] | None = None,
+                   limit: int | None = None) -> list[Row]:
     """Registry rows, optionally filtered. `names` match the board or the company name.
 
     priority=N keeps companies at priority N or more important (1 is highest).
     """
     query = select(companies_t).order_by(companies_t.c.priority, companies_t.c.name)
+    if limit is not None:
+        last_poll = select(collector_runs.c.source, collector_runs.c.board,
+            func.max(collector_runs.c.started_at).label("last_attempt"))\
+            .group_by(collector_runs.c.source, collector_runs.c.board).subquery()
+        query = query.outerjoin(last_poll, and_(last_poll.c.source == companies_t.c.collector,
+            last_poll.c.board == companies_t.c.board)).order_by(None).order_by(
+                last_poll.c.last_attempt.asc().nulls_first(), companies_t.c.priority, companies_t.c.name)
     if enabled_only:
         query = query.where(companies_t.c.enabled)
     if priority is not None:
         query = query.where(companies_t.c.priority <= priority)
+    if limit is not None and not names:
+        # Apply the scan budget on the server, not after transferring the registry.
+        query = query.limit(limit)
     rows = conn.execute(query).all()
     if names:
         rows = [r for r in rows if any(matches(r, n) for n in names)]
-    return rows
+    return rows[:limit] if limit is not None else rows
