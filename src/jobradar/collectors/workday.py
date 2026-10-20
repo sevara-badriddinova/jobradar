@@ -7,9 +7,10 @@ wd1:acme:45787465726e616c for site External. Never lowercase the site path.
 import json
 import logging
 import re
+from datetime import UTC, datetime, timedelta
 from urllib.parse import quote
 
-from jobradar.collectors.base import CollectorError, JobCollector, parse_iso_datetime
+from jobradar.collectors.base import PUBLICATION_MARGIN, CollectorError, JobCollector, parse_iso_datetime
 from jobradar.collectors.public import hydrate, location_strings, slug
 from jobradar.models import Job
 from jobradar.text import html_to_text
@@ -37,6 +38,7 @@ def decode_board(board: str) -> tuple[str, str, str]:
 class WorkdayCollector(JobCollector):
     source = "workday"
     page_size = 20  # CXS rejects larger limits on some tenants
+    reuses_known_details = "jobPostingInfo"
     max_pages = 1000
 
     def collect(self) -> list[Job]:
@@ -95,7 +97,10 @@ class WorkdayCollector(JobCollector):
             # always get the absolute startDate from the detail endpoint.
             old = re.fullmatch(r"Posted (\d+)\+? Days Ago", item.get("postedOn", ""))
             if old and int(old[1]) > 3:
-                return item
+                # Keep details fetched while it was fresh. Dropping them would
+                # erase the stored description and startDate as a "change".
+                stored = self.known.get(self.board + ":" + item["externalPath"], {}).get("jobPostingInfo")
+                return {**item, "jobPostingInfo": stored} if stored else item
             payload = self.fetch_json(base + quote(item["externalPath"], safe="/-_"))
             info = payload.get("jobPostingInfo") if isinstance(payload, dict) else None
             if not isinstance(info, dict) or not info.get("title"):
@@ -105,6 +110,17 @@ class WorkdayCollector(JobCollector):
         return self.normalize_all([r for r in hydrated
             if r.get("jobPostingInfo", {}).get("posted") is not False
             and r.get("jobPostingInfo", {}).get("canApply") is not False])
+
+    def known_older_than(self, job: Job, cutoff: datetime) -> bool:
+        if job.posted_at is not None:
+            return job.posted_at < cutoff - PUBLICATION_MARGIN
+        # Details are only fetched for fresh labels, so an old posting has no
+        # startDate; its "Posted N Days Ago" / "Posted 30+ Days Ago" label is
+        # a lower bound on its age. Unknown or localized labels prove nothing.
+        label = re.fullmatch(r"Posted (\d+)\+? Days Ago", str((job.raw or {}).get("postedOn", "")))
+        # Compare durations: a label of exactly the window length proves the age
+        # (the cutoff was computed moments before this call).
+        return bool(label) and timedelta(days=int(label[1])) >= datetime.now(UTC) - cutoff - timedelta(minutes=5)
 
     def _partial(self, reason: str) -> None:
         self.complete_snapshot = False

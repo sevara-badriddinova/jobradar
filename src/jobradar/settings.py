@@ -91,6 +91,19 @@ class NotionSettings(BaseModel):
         return self
 
 
+class IngestionSettings(BaseModel):
+    """What gets stored at all (separate from the alert filters' freshness window).
+
+    A posting that is *new to the database* is not stored when its provider's
+    publication date is trustworthy and older than `max_age_days` (plus a one-day
+    margin for time zones and date-only feeds). Known jobs, close detection,
+    undated and future-dated postings are unaffected. None disables the window.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    max_age_days: int | None = Field(default=30, ge=1)
+
+
 class Settings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -98,6 +111,15 @@ class Settings(BaseModel):
     preferences: Preferences = Preferences()
     notifications: NotificationSettings = NotificationSettings()
     notion: NotionSettings = NotionSettings()
+    ingestion: IngestionSettings = IngestionSettings()
+
+    @model_validator(mode="after")
+    def _ingestion_covers_alert_window(self):
+        window, alerts = self.ingestion.max_age_days, self.filters.max_posting_age_days
+        if window is not None and alerts is not None and window < alerts:
+            raise ValueError("[ingestion] max_age_days must be at least [filters] max_posting_age_days, "
+                             "or eligible postings would never be stored")
+        return self
 
 
 def load_settings(path: str | Path = "profile.toml") -> Settings:

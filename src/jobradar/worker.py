@@ -198,7 +198,8 @@ class Worker:
                 collector = self.collector_factory(board.collector, board.board, company=board.name,
                                                    client=self.http)
                 report = run_collector(self.engine, collector, after_ingest=queue_filters,
-                                       record_unchanged=False)
+                                       record_unchanged=False,
+                                       ingest_max_age_days=self.settings.ingestion.max_age_days)
                 nbytes = meter.total
                 pressured = meter.backpressure
         except BackpressureError:
@@ -230,6 +231,8 @@ class Worker:
                 self._boards.pop(board.company_id, None)
             self.wake["slot"].set()   # a provider slot opened: claim the next board now
         self.count(f"collect_{outcome}")
+        if report is not None and report.result is not None and report.result.skipped_old:
+            self.count("ingest_skipped_old", report.result.skipped_old)
         if outcome == "ok":
             self._last_board_ok = time.monotonic()
             if getattr(report, "queued", 0):

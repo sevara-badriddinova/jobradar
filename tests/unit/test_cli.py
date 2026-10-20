@@ -32,7 +32,8 @@ def registry(monkeypatch):
             rows = [r for r in rows if any(cli.matches(r, n) for n in names)]
         return rows
 
-    def fake_run_all(engine, collectors):
+    def fake_run_all(engine, collectors, *, ingest_max_age_days=None):
+        state["window"] = ingest_max_age_days
         state["ran"] = [(c.source, c.board, c.company) for c in collectors]
         state["clients"] = {id(c._client) for c in collectors}
         return state["reports"] or [RunReport(c.source, c.board, ok=True, result=IngestResult())
@@ -69,6 +70,7 @@ def test_collect_all_uses_registry_names_and_shares_one_client(registry, capsys)
     assert cli.main(["collect"]) == 0
     assert registry["ran"] == [("greenhouse", "stripe", "Stripe"), ("greenhouse", "figma", "Figma")]
     assert len(registry["clients"]) == 1  # connection pooling across boards
+    assert registry["window"] == 30       # [ingestion] max_age_days default
 
 
 def test_collect_passes_priority_filter(registry):

@@ -7,9 +7,10 @@ redoes the work: re-running is always safe (idempotent).
 
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from sqlalchemy import Text, case, column, func, or_, select, text, update, values
+from sqlalchemy import Text, case, column, func, literal, or_, select, text, update, values
 from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.engine import Connection
 
@@ -47,6 +48,7 @@ class IngestResult:
     duplicates: int = 0    # stored, linked to an original via level 2/3
     closed: int = 0        # disappeared from the board
     reopened: int = 0      # was closed, reappeared with the same ID
+    skipped_old: int = 0   # never stored: published before the ingestion window
 
     @property
     def new(self) -> int:
@@ -73,9 +75,28 @@ def _find_original(conn: Connection, column, value: str):
     ).first()
 
 
+# Raw fields that change on every poll without the posting changing. Workday's
+# "Posted N Days Ago" label ticks daily; comparing it rewrote and re-filtered
+# every undated Workday posting each day.
+VOLATILE_RAW_KEYS = {"workday": ("postedOn",)}
+
+
+def _stable(raw, source: str):
+    for key in VOLATILE_RAW_KEYS.get(source, ()):
+        raw = raw.op("-")(literal(key, Text))
+    return raw
+
+
 def ingest_snapshot(
-    conn: Connection, *, source: str, board: str, jobs: list[Job], complete: bool = True
+    conn: Connection, *, source: str, board: str, jobs: list[Job], complete: bool = True,
+    skip_new: Callable[[Job], bool] | None = None,
 ) -> IngestResult:
+    """Upsert one board snapshot.
+
+    skip_new(job) -> True marks a posting as certainly older than the ingestion
+    window; it is stored only if the database already knows it. Close detection
+    still uses every ID in the snapshot, so skipping never closes a job.
+    """
     result = IngestResult()
 
     # Serialize concurrent ingests of the *same* board (e.g. an overlapping
@@ -89,7 +110,18 @@ def ingest_snapshot(
         if job.source != source:
             raise ValueError(f"job from {job.source!r} in a {source!r} snapshot")
         snapshot[job.source_job_id] = job  # collapse in-batch repeats
-    ids = list(snapshot)
+    ids = list(snapshot)  # close detection: everything the board still lists
+
+    if skip_new is not None:
+        old = [sid for sid, job in snapshot.items() if skip_new(job)]
+        known = set()
+        for start in range(0, len(old), 1000):  # unique index (source, source_job_id)
+            known.update(conn.execute(select(jobs_t.c.source_job_id).where(
+                jobs_t.c.source == source, jobs_t.c.source_job_id.in_(old[start:start + 1000]))).scalars())
+        for sid in old:
+            if sid not in known:
+                del snapshot[sid]
+                result.skipped_old += 1
 
     # --- Level 1: one round-trip to find everything we already know --------
     existing = {}
@@ -102,7 +134,8 @@ def ingest_snapshot(
         rows = conn.execute(select(
             jobs_t.c.id, jobs_t.c.source_job_id, jobs_t.c.title, jobs_t.c.location,
             jobs_t.c.url, jobs_t.c.description_hash, jobs_t.c.closed_at, jobs_t.c.posted_at,
-            jobs_t.c.raw.is_distinct_from(incoming.c.payload).label("raw_changed"), jobs_t.c.company
+            _stable(jobs_t.c.raw, source).is_distinct_from(_stable(incoming.c.payload, source))
+            .label("raw_changed"), jobs_t.c.company
         ).join(incoming, jobs_t.c.source_job_id == incoming.c.sid).where(jobs_t.c.source == source))
         existing.update((r.source_job_id, r) for r in rows)
     result.seen = len(existing)

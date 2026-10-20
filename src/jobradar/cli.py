@@ -144,10 +144,15 @@ def cmd_collect(args) -> int:
               "`jobradar companies sync companies.toml`", file=sys.stderr)
         return 2
 
+    try:
+        window = load_settings(args.profile).ingestion.max_age_days
+    except SettingsError as exc:
+        print(exc, file=sys.stderr)
+        return 2
     with make_client() as client:  # one pooled client shared by all boards
         collectors = [build_collector(t.collector, t.board, company=t.name, client=client)
                       for t in targets]
-        reports = run_all(engine, collectors)
+        reports = run_all(engine, collectors, ingest_max_age_days=window)
 
     print(f"{'source/board':<32}{'ok':<5}{'fetched':>8}{'new':>6}{'seen':>6}"
           f"{'chg':>5}{'dup':>5}{'closed':>8}{'secs':>7}")

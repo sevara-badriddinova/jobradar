@@ -1,6 +1,6 @@
 import logging
 from abc import ABC, abstractmethod
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar
 
 import httpx
@@ -27,6 +27,11 @@ def parse_iso_datetime(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
+# Exact timestamps must be older than the window by this much more (time zones,
+# date-only feeds that parse as midnight UTC) before a posting is skipped.
+PUBLICATION_MARGIN = timedelta(days=1)
+
+
 class CollectorError(Exception):
     """A collector could not produce a trustworthy snapshot."""
 
@@ -49,6 +54,19 @@ class JobCollector(ABC):
     # that may miss postings (search-based, best-effort) must set this False.
     complete_snapshot: ClassVar[bool] = True
 
+    # Whether Job.posted_at is a real publication time that may be used to skip
+    # storing a never-seen posting as too old for the ingestion window.
+    publication_date_trusted: ClassVar[bool] = True
+
+    def known_older_than(self, job: Job, cutoff: datetime) -> bool:
+        """True only when this posting is certainly published before `cutoff`.
+
+        Missing, future, or untrusted dates are never "certainly old": such
+        postings are always stored and left to the regular filters.
+        """
+        return (self.publication_date_trusted and job.posted_at is not None
+                and job.posted_at < cutoff - PUBLICATION_MARGIN)
+
     def __init__(self, board: str, company: str | None = None,
                  client: httpx.Client | None = None) -> None:
         self.board = board.strip().lower()
@@ -56,6 +74,9 @@ class JobCollector(ABC):
         # so the same company gets the same name (and dedup key) on every source.
         self.company = company
         self._client = client  # shared, pooled client; otherwise one per request
+        # Optional {source_job_id: stored raw subset} for postings already in the
+        # database, so collectors can skip re-fetching details that cannot change.
+        self.known: dict[str, dict] = {}
 
     @abstractmethod
     def collect(self) -> list[Job]:

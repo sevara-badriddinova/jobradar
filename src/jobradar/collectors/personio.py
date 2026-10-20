@@ -1,5 +1,6 @@
 """Personio's public English XML feed plus JobPosting publication metadata."""
 
+import random
 import xml.etree.ElementTree as ET
 
 from jobradar.collectors.base import CollectorError, JobCollector, parse_iso_datetime
@@ -29,8 +30,12 @@ def descriptions(raw):
     return "\n\n".join(html_to_text(s.get("name", "") + "\n" + s.get("value", "")) for s in sections)
 
 
+REVERIFY = 12  # with 30-60 min revisits, each stored date is re-checked every ~6-12 h
+
+
 class PersonioCollector(JobCollector):
     source = "personio"
+    reuses_known_details = "publicationMetadata"
 
     def host(self):
         # Default is .de; .com is a distinct region, never silently substituted.
@@ -54,6 +59,13 @@ class PersonioCollector(JobCollector):
             job_id = raw["id"]
             if not job_id.isdigit():
                 raise CollectorError("invalid Personio job id")
+            # The XML feed carries title and description; the detail page only
+            # dates the posting. Reuse a stored date instead of 1-2 requests per
+            # job per poll, but re-verify a random 1/REVERIFY share each poll so a
+            # republication under the same ID is still picked up within hours.
+            stored = self.known.get(self.board + ":" + job_id, {}).get("publicationMetadata") or {}
+            if parse_iso_datetime(stored.get("datePosted")) and random.random() >= 1 / REVERIFY:
+                return {**raw, "publicationMetadata": stored}
             url = self.host() + "/job/" + job_id
             try:
                 page = self.fetch_data(url, params={"language": "en"}, as_text=True)

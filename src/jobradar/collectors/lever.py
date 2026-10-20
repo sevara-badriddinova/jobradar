@@ -17,6 +17,9 @@ API_URL = "https://api.lever.co/v0/postings/{board}"
 
 
 class LeverCollector(JobCollector):
+    # createdAt is when the posting was created in Lever, which can precede
+    # publication (drafts), so it never proves a posting is too old to store.
+    publication_date_trusted = False
     source = "lever"
 
     page_size = 100

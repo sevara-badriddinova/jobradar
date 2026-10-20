@@ -161,6 +161,11 @@ def test_stop_returns_within_the_deadline_and_releases_leases(engine):
     with engine.connect() as conn:
         assert conn.execute(select(func.count()).select_from(board_state)
                             .where(board_state.c.lease_owner.is_not(None))).scalar_one() == 0
+    # Let the deliberately abandoned slow collection finish so it cannot write
+    # into the next test's freshly truncated tables.
+    for t in threading.enumerate():
+        if t.name.startswith("collect"):
+            t.join(10)
 
 
 def test_crashed_collector_board_is_reclaimed_and_live_leases_are_extended(engine):
