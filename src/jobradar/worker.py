@@ -218,7 +218,12 @@ class Worker:
             if self._claim_seq % 2 == 0:
                 provider = min(open_, key=lambda p: (self._last_served.get(p, -1), due[p][0], due[p][1], p))
             else:
-                provider = min(open_, key=lambda p: (due[p][1], p))
+                # Overdue age is capped at one priority-3 revisit: providers whose
+                # boards are all that late (e.g. thousands of never-polled boards
+                # after a deploy) share this slot by rotation instead of one
+                # backlog holding it for hours.
+                floor = time.time() - 3 * self.cfg.base_interval
+                provider = min(open_, key=lambda p: (max(due[p][1], floor), self._last_served.get(p, -1), p))
             with self.engine.begin() as conn:
                 boards = q.claim_boards(conn, provider, self.owner, 1, self.cfg.board_lease)
             if not boards:

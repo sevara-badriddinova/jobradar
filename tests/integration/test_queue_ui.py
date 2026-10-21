@@ -209,3 +209,27 @@ def test_job_list_has_no_visible_ids_or_numbering_and_has_age(engine, server, tg
                                   "q:open:１２:new:0", "q:like:0:new:0"])
 def test_invalid_navigation_is_rejected(data):
     assert parse_callback(data) is None
+
+
+def test_mini_app_uses_the_same_freshness_rule_as_alerts(engine):
+    """A job alerted under the discovery rule must also be listed in the Mini
+    App; a newly added board's backlog must not be."""
+    from datetime import UTC, datetime, timedelta
+    from tests.factories import make_job
+    from tests.integration.helpers import ingest
+    now = datetime.now(UTC)
+    ingest(engine, [make_job("seed", title="Office Manager", posted_at=now - timedelta(days=20))])
+    ingest(engine, [make_job("seed", title="Office Manager", posted_at=now - timedelta(days=20)),
+                    make_job("listed", title="Backend Engineer", posted_at=now - timedelta(days=8))])
+    ingest(engine, [make_job("backlog", title="Platform Engineer", posted_at=now - timedelta(days=8))],
+           board="newco")
+    with engine.begin() as conn:
+        conn.execute(update(jobs).where(jobs.c.source_job_id.in_(["listed", "backlog"]))
+                     .values(status="MATCHED", match_score=90, filtered_at=now))
+        request_queue(conn, CHAT, min_score=60, max_posting_age_days=3, discovery_days=14)
+        body, _ = render_queue(conn, read_state(conn, CHAT))
+        strict_state = {**read_state(conn, CHAT), "max_discovery_age_days": None}
+        strict_body, _ = render_queue(conn, strict_state)
+    assert "Backend Engineer" in body and "Platform Engineer" not in body
+    assert "newly listed and posted within 14 days" in body
+    assert "Backend Engineer" not in strict_body

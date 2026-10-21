@@ -258,7 +258,12 @@ def run_filters(conn: Connection, settings: FilterSettings, *, recheck: bool = F
     An enabled posting-age cutoff is rechecked every run, including NOTIFIED
     jobs, while application facts and review choices are retained.
     """
-    signature = hashlib.sha256(json.dumps({"filters": settings.model_dump(),
+    # The discovery window is left out on purpose: it only widens freshness for
+    # postings first seen in the last 72 h, which migration 0015 re-queues, and
+    # a full recheck (several heap scans of jobs, one transaction) is not worth
+    # that on the VM's disk. Including it (even unset) would force one on deploy.
+    policy = settings.model_dump(exclude={"max_discovery_age_days"})
+    signature = hashlib.sha256(json.dumps({"filters": policy,
         "needs_sponsorship": needs_sponsorship, "version": 5}, sort_keys=True).encode()).hexdigest()
     previous = conn.execute(select(app_state.c.value).where(app_state.c.key == "filter_context")).scalar_one_or_none()
     recheck = recheck or previous != signature

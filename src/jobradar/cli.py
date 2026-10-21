@@ -320,10 +320,12 @@ def prepare_delivery(engine, chat_id, profile_settings) -> dict:
                          discovery_days=profile_settings.filters.max_discovery_age_days)
         if settings.delivery == "queue":
             request_queue(conn, chat_id, min_score=settings.digest_min_score, publish=True,
-                          max_posting_age_days=max_age)
+                          max_posting_age_days=max_age,
+                          discovery_days=profile_settings.filters.max_discovery_age_days)
         else:
             request_queue(conn, chat_id, create=False, min_score=settings.digest_min_score, publish=False,
-                          max_posting_age_days=max_age)
+                          max_posting_age_days=max_age,
+                          discovery_days=profile_settings.filters.max_discovery_age_days)
     return queued
 
 
@@ -462,6 +464,7 @@ def cmd_telegram_listen(args) -> int:
                     if not policy_ready:
                         with engine.begin() as conn:
                             request_queue(conn, chat_id, max_posting_age_days=settings.filters.max_posting_age_days,
+                                          discovery_days=settings.filters.max_discovery_age_days,
                                           min_score=settings.notifications.digest_min_score)
                         policy_ready = True
                     if pressed := process_updates(engine, tg, chat_id, timeout=5):

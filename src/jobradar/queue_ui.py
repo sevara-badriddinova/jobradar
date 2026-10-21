@@ -40,7 +40,8 @@ def write_state(conn, chat_id, state):
 
 
 def request_queue(conn, chat_id, *, view=None, page=None, job_id=None,
-                  explicit=False, create=True, min_score=None, publish=None, max_posting_age_days=_UNCHANGED):
+                  explicit=False, create=True, min_score=None, publish=None, max_posting_age_days=_UNCHANGED,
+                  discovery_days=_UNCHANGED):
     state = read_state(conn, chat_id, lock=True)
     if state is None:
         if not create:
@@ -55,6 +56,9 @@ def request_queue(conn, chat_id, *, view=None, page=None, job_id=None,
         state.update(view=view, page=page or 0, job_id=job_id)
     if max_posting_age_days is not _UNCHANGED:
         state["max_posting_age_days"] = max_posting_age_days
+    if discovery_days is not _UNCHANGED:
+        # The same freshness rule as filtering and alerts (see recency.py).
+        state["max_discovery_age_days"] = discovery_days
     if min_score is not None:
         state["min_score"] = min_score
     if publish is not None:
@@ -89,9 +93,9 @@ def parse_callback(data):
     return action, job_id, view, int(page)
 
 
-def _query(view, min_score, max_posting_age_days=None):
+def _query(view, min_score, max_posting_age_days=None, discovery_days=None):
     active = and_(jobs.c.closed_at.is_(None), jobs.c.status.in_(["MATCHED", "NOTIFIED"]),
-                  recent_jobs(max_posting_age_days))
+                  recent_jobs(max_posting_age_days, discovery_days=discovery_days))
     predicates = {
         "new": and_(active, jobs.c.match_score >= min_score, job_reviews.c.job_id.is_(None)),
         "liked": and_(active, job_reviews.c.choice == "QUEUED"),
@@ -117,7 +121,8 @@ def _e(value, length=150):
 def render_queue(conn, state):
     view = state["view"]
     max_age = state.get("max_posting_age_days")
-    counts = {v: conn.execute(select(func.count()).select_from(_query(v, state["min_score"], max_age).subquery())).scalar_one()
+    discovery = state.get("max_discovery_age_days")
+    counts = {v: conn.execute(select(func.count()).select_from(_query(v, state["min_score"], max_age, discovery).subquery())).scalar_one()
               for v in VIEWS}
     if view == "menu":
         return ("🏠 <b>JobRadar</b>\nChoose a list to browse your jobs.",
@@ -133,7 +138,9 @@ def render_queue(conn, state):
             .outerjoin(job_matches, job_matches.c.id == jobs.c.match_id)
             .where(jobs.c.id == state["job_id"])).first()
         if job is not None and (view in ("applied", "skipped") or
-                                publication_reason(job.posted_at, max_age) is None):
+                                publication_reason(job.posted_at, max_age, first_seen_at=job.first_seen_at,
+                                                   backfill=job.discovered_in_backfill,
+                                                   discovery_days=discovery) is None):
             score = f"{float(job.match_score):.0f}% match" if job.match_score is not None else "Not scored"
             status = ("Applied" if job.status == "APPLIED" else "Rejected" if job.status == "REJECTED"
                       else "Closed" if job.closed_at else
@@ -157,12 +164,13 @@ def render_queue(conn, state):
                              {"text": "🛂 Sponsorship required", "callback_data": callback("sponsorship")}]]
             buttons += [[{"text": "⬅️ Back to jobs", "callback_data": f"q:list:{view}:{page}"}], home]
             return "\n".join(lines), buttons
-    rows = conn.execute(_query(view, state["min_score"], max_age).order_by(jobs.c.match_score.desc().nullslast(), jobs.c.id)
+    rows = conn.execute(_query(view, state["min_score"], max_age, discovery).order_by(jobs.c.match_score.desc().nullslast(), jobs.c.id)
                         .offset(page * PAGE_SIZE).limit(PAGE_SIZE)).all()
     lines = ["📋 <b>Your jobs</b>", f"{VIEW_ICONS[view]} {VIEWS[view]} · {counts[view]} job{'s' if counts[view] != 1 else ''}",
              *(["Tap a job below to review it."] if rows else [])]
     if max_age is not None and view in ("new", "liked"):
-        lines.append(f"Posted within the last {max_age} days.")
+        lines.append(f"Posted within the last {max_age} days" + (
+            f", or newly listed and posted within {discovery} days." if discovery else "."))
     buttons = []
     for job in rows:
         score = f"{float(job.match_score):.0f}%" if job.match_score is not None else "Unscored"
@@ -178,7 +186,7 @@ def render_queue(conn, state):
                            "applied": "No applications recorded yet.",
                            "skipped": "No skipped jobs."}[view]]
         if view == "new":
-            active = and_(jobs.c.closed_at.is_(None), recent_jobs(max_age))
+            active = and_(jobs.c.closed_at.is_(None), recent_jobs(max_age, discovery_days=discovery))
             below = conn.execute(select(func.count()).select_from(jobs).where(active,
                 jobs.c.status.in_(["MATCHED", "NOTIFIED"]),
                 jobs.c.match_score < state["min_score"])).scalar_one()
@@ -218,7 +226,8 @@ def sync_queue(engine, tg, chat_id):
             eligible = select(jobs.c.id).outerjoin(job_reviews, job_reviews.c.job_id == jobs.c.id).where(
                 jobs.c.status.in_(["MATCHED", "NOTIFIED"]), jobs.c.closed_at.is_(None),
                 jobs.c.match_score >= state["min_score"],
-                recent_jobs(state.get("max_posting_age_days")),
+                recent_jobs(state.get("max_posting_age_days"),
+                            discovery_days=state.get("max_discovery_age_days")),
                 or_(job_reviews.c.choice.is_(None), job_reviews.c.choice == "QUEUED"))
             conn.execute(update(notifications).where(notifications.c.channel == "telegram",
                 notifications.c.status == "pending", notifications.c.job_id.not_in(eligible)).values(status="cancelled"))
@@ -228,7 +237,8 @@ def sync_queue(engine, tg, chat_id):
                 .where(notifications.c.channel == "telegram", notifications.c.status == "pending",
                        jobs.c.status.in_(["MATCHED", "NOTIFIED"]), jobs.c.closed_at.is_(None),
                        jobs.c.match_score >= state["min_score"],
-                       recent_jobs(state.get("max_posting_age_days")),
+                       recent_jobs(state.get("max_posting_age_days"),
+                            discovery_days=state.get("max_discovery_age_days")),
                        or_(job_reviews.c.choice.is_(None), job_reviews.c.choice == "QUEUED"))).all()
         if not state.get("message_id"):
             state["sending"] = True

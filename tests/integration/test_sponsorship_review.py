@@ -194,7 +194,8 @@ def test_cli_lists_keeps_and_dismisses(engine, db_env, capsys):
     from jobradar.cli import main
     ingest(engine, [posting("a"), posting("b", title="Data Engineer")])
     filter_now(engine)
-    a, b = held(engine)
+    by_title = {e.title: e for e in held(engine)}
+    a, b = by_title["Backend Engineer"], by_title["Data Engineer"]
     assert main(["sponsorship-review"]) == 0
     out = capsys.readouterr().out
     assert "2 pending" in out and "Backend Engineer" in out and "Data Engineer" in out
@@ -229,3 +230,16 @@ def test_migration_requeues_recent_no_explicit_rejections_only(scratch, monkeypa
     with scratch.connect() as conn:
         pending = dict(conn.execute(text("SELECT source_job_id, filtered_at IS NULL FROM jobs")).all())
     assert pending == {"recent": True, "stale": False, "other": False}
+
+
+def test_two_held_jobs_with_one_fingerprint_in_one_batch(engine):
+    """A repost and its (reopened) original can be held together; the upsert
+    must not propose the same queue key twice in one statement."""
+    ingest(engine, [posting("orig")])
+    ingest(engine, [posting("repost")], board="acme-careers")
+    with engine.begin() as conn:      # make both canonical, as after a reopen
+        conn.execute(update(jobs_t).values(status="DISCOVERED", duplicate_of_id=None, dedup_reason=None))
+    result = filter_now(engine)
+    assert result.rejected[UNKNOWN_REASON] == 2
+    [entry] = held(engine)
+    assert entry.job_id == row(engine, "repost").id

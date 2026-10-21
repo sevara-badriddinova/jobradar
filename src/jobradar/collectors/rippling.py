@@ -10,9 +10,10 @@ from jobradar.text import html_to_text
 
 class RipplingCollector(JobCollector):
     source = "rippling"
-    # One detail request per posting on every poll, with no stored reuse:
-    # compare the listing first and skip details for rejected titles.
-    title_first = True
+    # One detail request per posting on every poll: compare the listing first,
+    # so an unchanged board costs one request. No title-first skipping: Rippling
+    # has no stored-detail reuse, so a skipped detail would replace the stored
+    # description and date of an existing posting with listing-only fields.
     early_digest = True
 
     def collect(self):
@@ -22,8 +23,6 @@ class RipplingCollector(JobCollector):
         self.check_listing_digest(records)
 
         def detail(item):
-            if not self.needs_detail(item.get("name")):
-                return item          # listing fields only; the title filter rejects it anyway
             job_id = slug(item["uuid"])
             raw = self.fetch_json(base + "/" + quote(job_id, safe=""))
             if not isinstance(raw, dict) or raw.get("uuid") != job_id:

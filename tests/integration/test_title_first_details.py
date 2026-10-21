@@ -215,23 +215,37 @@ def test_worker_collects_a_big_workday_board_within_the_budget(engine):
 
 # --- Rippling and Personio ---------------------------------------------------------------
 
-def test_rippling_skips_details_for_rejected_titles_and_fetches_unnamed_items():
-    requests = []
-    listing = [{"uuid": "1", "name": "Software Engineer"}, {"uuid": "2", "name": "Account Manager"},
-               {"uuid": "3"}]
-
+def rippling_client(listing, requests):
     def handle(request):
         requests.append(request.url.path)
         if request.url.path.endswith("/jobs"):
             return httpx.Response(200, json=listing)
         return httpx.Response(200, json=rippling_item(request.url.path.rsplit("/", 1)[-1]))
-    c = build_collector("rippling", "acme", company="Acme",
-                        client=httpx.Client(transport=httpx.MockTransport(handle)))
+    return httpx.Client(transport=httpx.MockTransport(handle))
+
+
+def test_rippling_never_skips_details_so_stored_postings_keep_their_details():
+    """Rippling has no stored-detail reuse: skipping a detail would overwrite an
+    existing posting's description and date with listing-only fields."""
+    requests = []
+    listing = [{"uuid": "1", "name": "Software Engineer"}, {"uuid": "2", "name": "Account Manager"}]
+    c = build_collector("rippling", "acme", company="Acme", client=rippling_client(listing, requests))
     c.wants_detail = wants
     jobs = {j.source_job_id: j for j in c.collect()}
-    details = sorted(p.rsplit("/", 1)[-1] for p in requests if not p.endswith("/jobs"))
-    assert details == ["1", "3"] and set(jobs) == {"1", "2", "3"}
-    assert jobs["2"].posted_at is None and jobs["1"].posted_at is not None
+    assert sorted(p.rsplit("/", 1)[-1] for p in requests if not p.endswith("/jobs")) == ["1", "2"]
+    assert all(j.posted_at is not None and j.description for j in jobs.values())
+
+
+def test_rippling_unchanged_listing_skips_every_detail():
+    listing = [{"uuid": "1", "name": "Software Engineer"}, {"uuid": "2", "name": "Account Manager"}]
+    first = build_collector("rippling", "acme", company="Acme", client=rippling_client(listing, []))
+    first.collect()
+    requests = []
+    again = build_collector("rippling", "acme", company="Acme", client=rippling_client(listing, requests))
+    again.known_digest = first.snapshot_digest
+    with pytest.raises(UnchangedSnapshot):
+        again.collect()
+    assert requests == ["/platform/api/ats/v1/board/acme/jobs"]
 
 
 def test_personio_skips_dating_rejected_titles():

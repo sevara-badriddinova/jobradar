@@ -14,7 +14,7 @@ override: the role then goes through the normal pipeline (AI score, alerts).
 from __future__ import annotations
 
 from sqlalchemy import and_, func, select, update
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.dialects.postgresql import distinct_on, insert
 from sqlalchemy.engine import Connection
 
 from jobradar.db import jobs, sponsorship_reviews
@@ -27,8 +27,12 @@ def hold(conn: Connection, job_ids: list[int]) -> int:
     """Add or refresh queue entries for these held jobs. Idempotent."""
     if not job_ids:
         return 0
-    rows = select(jobs.c.fingerprint, jobs.c.id, jobs.c.company, jobs.c.title, jobs.c.location,
-                  jobs.c.url, jobs.c.posted_at).where(jobs.c.id.in_(job_ids))
+    # One row per fingerprint (the newest job): ON CONFLICT DO UPDATE fails if
+    # one statement proposes the same key twice (e.g. a repost and its
+    # reopened original held in the same batch).
+    rows = (select(jobs.c.fingerprint, jobs.c.id, jobs.c.company, jobs.c.title, jobs.c.location,
+                   jobs.c.url, jobs.c.posted_at).where(jobs.c.id.in_(job_ids))
+            .ext(distinct_on(jobs.c.fingerprint)).order_by(jobs.c.fingerprint, jobs.c.id.desc()))
     stmt = insert(sponsorship_reviews).from_select(
         ["fingerprint", "job_id", "company", "title", "location", "url", "posted_at"], rows)
     stmt = stmt.on_conflict_do_update(

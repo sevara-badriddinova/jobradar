@@ -34,6 +34,6 @@ def display_columns():
     """Queue rendering needs dates and labels, never the posting body."""
     return [jobs.c.id, jobs.c.source, jobs.c.company, jobs.c.title, jobs.c.location,
             jobs.c.url, jobs.c.status, jobs.c.closed_at, jobs.c.match_score,
-            jobs.c.posted_at, jobs.c.first_seen_at,
+            jobs.c.posted_at, jobs.c.first_seen_at, jobs.c.discovered_in_backfill,
             _object(first_published=jobs.c.raw["first_published"],
                     updated_at=jobs.c.raw["updated_at"]).label("raw")]

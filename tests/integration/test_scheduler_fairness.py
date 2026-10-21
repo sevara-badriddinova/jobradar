@@ -122,3 +122,18 @@ def test_default_interval_is_sized_to_capacity():
     cfg = WorkerConfig()
     # 12k priority-3 boards every base*3 seconds must stay under ~60 boards/min.
     assert 12_237 / (cfg.base_interval * 3 / 60) < 60
+
+
+def test_a_never_polled_backlog_does_not_monopolize_the_oldest_slot(engine):
+    """After deploy 3,929 boards are never-polled ('-infinity'). Greenhouse boards
+    that are hours overdue must keep a fair share meanwhile."""
+    seed(engine, {"greenhouse": 30, "personio": 30, "recruitee": 30})
+    set_due(engine, "greenhouse", 300)            # 5 h overdue; the others never polled
+    w = worker(engine)
+    served = Counter()
+    for _ in range(15):
+        w._due_cache = ({}, -1e18)
+        boards = w.claim_boards(2)
+        served.update(b.collector for b in boards)
+        finish_all(engine, w, boards)
+    assert served["greenhouse"] >= 8 and served["personio"] >= 8 and served["recruitee"] >= 8

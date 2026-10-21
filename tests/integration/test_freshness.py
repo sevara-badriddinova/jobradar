@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from itertools import product
 
 import pytest
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 
 from jobradar.db import jobs as jobs_t, notifications
 from jobradar.filters import run_filters
@@ -19,6 +19,7 @@ from jobradar.settings import FilterSettings, IngestionSettings, Preferences, Se
 from tests.factories import assessment, make_job
 from tests.integration.helpers import ingest, row
 from tests.integration.test_matcher import add_profile
+from tests.integration.test_migrations import scratch  # noqa: F401 - fixture
 from tests.integration.test_workers import (SETTINGS, add_board, boards, llm, make_due, make_worker,  # noqa: F401
                                             poll, telegram)
 
@@ -209,3 +210,38 @@ def test_same_snapshot_relisting_is_a_repost_but_partial_snapshots_stay_duplicat
     parallel = v1.model_copy(update={"source_job_id": "p", "url": "https://example.com/p"})
     ingest(engine, [parallel], board="acme-eu")         # another board still lists the original
     assert row(engine, "p").status == "DUPLICATE"
+
+
+def test_discovery_window_does_not_change_the_filter_policy_signature(engine):
+    """Adding/enabling the window must not force a full recheck (heap scans of
+    jobs in one transaction) on deploy; 0015 re-queues the affected rows."""
+    from jobradar.db import app_state
+    def signature(policy):
+        with engine.begin() as conn:
+            run_filters(conn, policy)
+            return conn.execute(select(app_state.c.value).where(app_state.c.key == "filter_context")).scalar_one()
+    assert signature(FilterSettings(max_posting_age_days=3)) == signature(POLICY)
+
+
+def test_migration_0015_requeues_only_recent_too_old_rejections(scratch, monkeypatch):
+    from alembic import command
+    from alembic.config import Config
+    from jobradar.db import migrate
+    monkeypatch.setattr("jobradar.repository._is_initial_scan", lambda *a: False)
+    config = Config()
+    config.set_main_option("script_location", "jobradar:migrations")
+    with scratch.connect() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, "0014")
+    ingest(scratch, [make_job(s, title=f"Engineer {s}", posted_at=ago(days=d)) for s, d in
+                     [("recent", 8), ("ancient", 60), ("seen_long_ago", 8), ("title", 8)]])
+    with scratch.begin() as conn:
+        conn.execute(text("UPDATE jobs SET status = 'FILTERED', filtered_at = now(), "
+                          "filter_reason = 'posting date: older than 3 days'"))
+        conn.execute(text("UPDATE jobs SET first_seen_at = now() - interval '9 days' "
+                          "WHERE source_job_id = 'seen_long_ago'"))
+        conn.execute(text("UPDATE jobs SET filter_reason = 'title: senior' WHERE source_job_id = 'title'"))
+    migrate(scratch)
+    with scratch.connect() as conn:
+        pending = dict(conn.execute(text("SELECT source_job_id, filtered_at IS NULL FROM jobs")).all())
+    assert pending == {"recent": True, "ancient": False, "seen_long_ago": False, "title": False}
