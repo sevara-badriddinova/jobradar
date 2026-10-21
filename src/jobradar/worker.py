@@ -86,7 +86,8 @@ class WorkerConfig:
     idle_sleep: float = 5.0
     maintenance_interval: float = 30.0
     link_interval: float = 120.0
-    sweep_interval: float = 600.0
+    sweep_interval: float = 3600.0         # belt and braces: every new job already has a task;
+                                           # delivery re-checks the 72 h window at send time
     seed_interval: float = 600.0
     discover_interval: float = 3600.0
     metrics_interval: float = 60.0

@@ -289,9 +289,13 @@ def run_filters(conn: Connection, settings: FilterSettings, *, recheck: bool = F
         # scan. Ingestion clears filtered_at after date/content changes, and
         # policy changes deliberately recheck everything. Future dates remain
         # eligible for the moving time window.
-        expiry_candidates = or_(jobs.c.filtered_at.is_(None), jobs.c.status != "FILTERED",
-            jobs.c.filter_reason.is_(None), jobs.c.filter_reason.not_like("posting date:%"),
-            jobs.c.filter_reason == "posting date: in the future")
+        # Content rejections (title/visa/experience/location) are final until
+        # the posting or the policy changes (ingestion clears filtered_at; a
+        # policy change rechecks everything), so they are never relabelled as
+        # expired: that rewrote thousands of rows a day for nothing and kept
+        # them in the expiry index (0013 indexes exactly this candidate set).
+        expiry_candidates = or_(jobs.c.status != "FILTERED", jobs.c.filtered_at.is_(None),
+            jobs.c.filter_reason.is_(None), jobs.c.filter_reason == "posting date: in the future")
         for reason, predicate in reasons:
             count = conn.execute(update(jobs).where(active, predicate,
                 true() if recheck else expiry_candidates,
@@ -300,21 +304,28 @@ def run_filters(conn: Connection, settings: FilterSettings, *, recheck: bool = F
                     status="FILTERED", filter_reason=reason, filtered_at=func.now())).rowcount
             if count:
                 result.rejected[reason] += count
-    pending = active if recheck else and_(active, or_(jobs.c.filtered_at.is_(None),
-        jobs.c.filter_reason == "posting date: in the future"))
-    pending = and_(pending, recent_jobs(settings.max_posting_age_days, now))
+    if recheck:
+        pending = and_(active, recent_jobs(settings.max_posting_age_days, now))
+    else:
+        # Exactly the ix_jobs_pending_active predicate, nothing else: a posted_at
+        # range here made PostgreSQL walk the date index over every recent open
+        # job (~30k heap pages per sweep in production) to find a handful of
+        # pending rows. The publication window is checked in Python instead.
+        pending = and_(active, or_(jobs.c.filtered_at.is_(None),
+                                   jobs.c.filter_reason == "posting date: in the future"))
     decisions: dict[str | None, list[int]] = {}
     # Read small metadata first: excluded titles never need a description.
     cursor = 0
     while True:
-        rows = conn.execute(select(jobs.c.id, jobs.c.title).where(pending, jobs.c.id > cursor)
-                            .order_by(jobs.c.id).limit(250)).all()
+        rows = conn.execute(select(jobs.c.id, jobs.c.title, jobs.c.posted_at)
+                            .where(pending, jobs.c.id > cursor).order_by(jobs.c.id).limit(250)).all()
         if not rows:
             break
         cursor = rows[-1].id
         body_ids = []
         for row in rows:
-            reason = title_reason(row.title, settings)
+            reason = (publication_reason(row.posted_at, settings.max_posting_age_days, now)
+                      or title_reason(row.title, settings))
             if reason:
                 decisions.setdefault(reason, []).append(row.id)
             else:

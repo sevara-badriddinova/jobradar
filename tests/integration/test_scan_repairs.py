@@ -76,7 +76,7 @@ def test_empty_incremental_filter_uses_small_indexes(engine):
     assert len(plans) == 4
     assert all("Seq Scan" not in plan for plan in plans)
     assert "ix_jobs_pending_active" in plans[-1]
-    assert all("ix_jobs_expiry_active" in plan for plan in plans[:3])
+    assert all("ix_jobs_expiry_open" in plan for plan in plans[:3])
 
 
 def test_never_filtered_duplicates_do_not_force_sequential_sweeps(engine):
@@ -109,3 +109,71 @@ def test_never_filtered_duplicates_do_not_force_sequential_sweeps(engine):
     finally:
         event.remove(engine, "before_cursor_execute", capture)
     assert plans and all("Seq Scan" not in plan for plan in plans)
+
+
+def _recent_title_rejections(conn, n):
+    conn.execute(text(f"""
+        INSERT INTO jobs (source,board,source_job_id,company,company_key,title,url,canonical_url,
+            description,description_hash,fingerprint,raw,status,posted_at,filtered_at,filter_reason)
+        SELECT 'greenhouse','recent',n::text,'Acme','acme','Account Manager','u','u',repeat('d', 2000),
+            'h','f','{{}}','FILTERED',now()-interval '1 day',now(),'title: not a software engineering role'
+        FROM generate_series(1,{n}) n
+    """))
+    conn.execute(text("ANALYZE jobs"))
+
+
+def test_sweep_reads_only_pending_rows_not_every_recent_rejection(engine):
+    """Production: 30k heap pages per sweep to decide 3 jobs. Thousands of
+    recent title rejections must not be visited by an incremental sweep."""
+    now = datetime.now(UTC)
+    with engine.begin() as conn:
+        run_filters(conn, FilterSettings(max_posting_age_days=3))   # store the policy: incremental from now on
+        _recent_title_rejections(conn, 20000)
+    ingest(engine, [make_job("new", title="Backend Engineer", posted_at=now - timedelta(hours=1))])
+    buffers, plans, statements = [], [], []
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("SELECT jobs.id, jobs.title"):
+            statements.append(statement)
+            with conn.connection.cursor() as explain:
+                explain.execute("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + statement, parameters)
+                plan = explain.fetchone()[0][0]["Plan"]
+                buffers.append(plan.get("Shared Hit Blocks", 0) + plan.get("Shared Read Blocks", 0))
+                plans.append(str(plan))
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        with engine.begin() as conn:
+            result = run_filters(conn, FilterSettings(max_posting_age_days=3))
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+    assert result.passed == 1
+    assert all("ix_jobs_pending_active" in p for p in plans)
+    assert max(buffers) < 50          # was proportional to the 20k recent rejections
+    # Production's planner chose the posted_at index for this statement because
+    # of its date range; the incremental pending query must not offer one.
+    assert statements and all("posted_at" not in st.split("WHERE", 1)[1] for st in statements)
+
+
+def test_content_rejections_are_never_rewritten_as_they_age(engine):
+    now = datetime.now(UTC)
+    ingest(engine, [make_job("sr", title="Senior Backend Engineer", posted_at=now - timedelta(days=1))])
+    with engine.begin() as conn:
+        run_filters(conn, FilterSettings(max_posting_age_days=3))
+        before = conn.execute(text("SELECT xmin::text, filter_reason, filtered_at FROM jobs")).one()
+        conn.execute(text("UPDATE jobs SET posted_at = now() - interval '9 days'"))  # time passes
+        before = conn.execute(text("SELECT xmin::text, filter_reason, filtered_at FROM jobs")).one()
+    with engine.begin() as conn:
+        assert run_filters(conn, FilterSettings(max_posting_age_days=3)).rejected.total() == 0
+        after = conn.execute(text("SELECT xmin::text, filter_reason, filtered_at FROM jobs")).one()
+    assert after == before and after.filter_reason == "title: senior"
+
+
+def test_eligible_jobs_still_expire_out_of_the_window(engine):
+    now = datetime.now(UTC)
+    ingest(engine, [make_job("ok", title="Backend Engineer", posted_at=now - timedelta(days=1))])
+    with engine.begin() as conn:
+        assert run_filters(conn, FilterSettings(max_posting_age_days=3)).passed == 1
+        conn.execute(text("UPDATE jobs SET status = 'MATCHED', match_score = 90, "
+                          "posted_at = now() - interval '4 days'"))
+    with engine.begin() as conn:
+        res = run_filters(conn, FilterSettings(max_posting_age_days=3))
+    assert res.rejected == {"posting date: older than 3 days": 1}
