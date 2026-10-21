@@ -725,8 +725,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--ai-daily-budget-usd", type=float,
                    help="pause matching (jobs stay queued) once today's UTC spend reaches this; "
                         "default: $JOBRADAR_AI_DAILY_BUDGET_USD, else uncapped")
-    p.add_argument("--base-interval-minutes", type=positive_int, default=30,
-                   help="healthy board revisit interval, multiplied by its priority")
+    p.add_argument("--base-interval-minutes", type=positive_int, default=80,
+                   help="healthy board revisit interval, multiplied by its priority "
+                        "(80 x priority 3 = every 4 h, sized to the 1 GB VM)")
     p.add_argument("--byte-budget-mb", type=positive_int, default=64)
     p.add_argument("--discover", action="store_true", help="refresh the board directory hourly (daily-cached)")
     p.add_argument("--duration", type=float, help="stop after this many seconds (trials)")

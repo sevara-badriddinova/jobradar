@@ -255,13 +255,26 @@ def claim_boards(conn: Connection, collector: str, owner: str, limit: int,
 
 
 def due_providers(conn: Connection) -> dict[str, int]:
-    """Due board count per provider (drives claiming and the coverage metric)."""
+    """Due board count per provider (the coverage metric)."""
+    return {p: n for p, (n, _) in due_overview(conn).items()}
+
+
+def due_overview(conn: Connection) -> dict[str, tuple[int, float]]:
+    """Per provider: due board count and its most overdue `next_due_at` (epoch
+    seconds; never-polled '-infinity' boards sort first as -1e18).
+
+    Claiming orders providers by the oldest due board, not by backlog size:
+    ordering by count let the providers with the biggest backlog take every
+    slot forever while small providers (Lever, Personio, ...) never ran.
+    """
     rows = conn.execute(text("""
-        SELECT c.collector, count(*) FROM board_state b JOIN companies c ON c.id = b.company_id
+        SELECT c.collector, count(*),
+               min(CASE WHEN isfinite(b.next_due_at) THEN extract(epoch FROM b.next_due_at) ELSE -1e18 END)
+        FROM board_state b JOIN companies c ON c.id = b.company_id
         WHERE c.enabled AND b.next_due_at <= now() AND (b.lease_until IS NULL OR b.lease_until < now())
         GROUP BY c.collector
     """)).all()
-    return {r[0]: r[1] for r in rows}
+    return {r[0]: (r[1], float(r[2])) for r in rows}
 
 
 _STATUS = re.compile(r"\bHTTP (\d{3})\b")
@@ -347,5 +360,5 @@ def requeue_boards(conn: Connection, names: list[str] | None = None) -> int:
 
 __all__ = ["Task", "Board", "enqueue", "enqueue_pending_filters", "claim", "extend", "complete",
            "fail", "release", "release_owner", "bury_exhausted", "retry_delay", "seed_boards",
-           "claim_boards", "due_providers", "failure_kind", "next_poll_delay", "finish_board",
+           "claim_boards", "due_providers", "due_overview", "failure_kind", "next_poll_delay", "finish_board",
            "extend_board", "requeue_boards"]

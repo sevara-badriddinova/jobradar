@@ -66,7 +66,10 @@ class WorkerConfig:
     provider_concurrency: dict[str, int] = field(default_factory=lambda: {
         "greenhouse": 3, "workday": 2, "ashby": 2, "lever": 2})
     default_provider_concurrency: int = 2
-    base_interval: float = 1800.0          # healthy board revisit (x priority)
+    # Healthy board revisit (x priority). 80 min x priority 3 = every 4 h:
+    # 12k priority-3 boards need ~51 boards/min, inside the 1 GB VM's measured
+    # 50-100/min. The old 30 min (136 boards/min) left a permanent backlog.
+    base_interval: float = 4800.0
     byte_budget: int = 64 * MB             # response bytes held by all collections
     max_response: int = 128 * MB           # a single response larger than this fails
     byte_wait: float = 30.0
@@ -131,7 +134,9 @@ class Worker:
         self._match_fail_streak = 0
         self._notify_fail_streak = 0
         self._backlog = (0, 0, 0.0)                   # filter, match, measured at
-        self._due_cache: tuple[dict[str, int], float] = ({}, -1e18)
+        self._due_cache: tuple[dict[str, tuple[int, float]], float] = ({}, -1e18)
+        self._claim_seq = 0                    # fair-claim rotation state
+        self._last_served: dict[str, int] = {}
 
     # --- small helpers ----------------------------------------------------------------
     def count(self, key: str, n: int = 1) -> None:
@@ -175,38 +180,55 @@ class Worker:
         fresh = time.monotonic() - at > self.cfg.due_cache_seconds
         if fresh:
             with self.engine.begin() as conn:
-                due = q.due_providers(conn)
+                due = q.due_overview(conn)
             self._due_cache = (due, time.monotonic())
         claimed = self._claim_from(due, free)
         if not claimed and not fresh and self._spare_capacity(due):
             # Nothing came from the cached providers although slots are free:
             # the cached view may be stale (e.g. other providers became due).
             with self.engine.begin() as conn:
-                due = q.due_providers(conn)
+                due = q.due_overview(conn)
             self._due_cache = (due, time.monotonic())
             claimed = self._claim_from(due, free)
         return claimed
 
-    def _spare_capacity(self, due: dict[str, int]) -> bool:
+    def _spare_capacity(self, due: dict) -> bool:
         """True unless every cached due provider is already at its concurrency cap."""
         return not due or any(self._inflight[p] < self.provider_limit(p) for p in due)
 
-    def _claim_from(self, due: dict[str, int], free: int) -> list[q.Board]:
-        providers = sorted(due, key=lambda p: -due[p])
+    def _claim_from(self, due: dict[str, tuple[int, float]], free: int) -> list[q.Board]:
+        """Fair claiming across providers, one board per slot.
+
+        Even slots rotate: they go to the due provider served least recently,
+        so every provider with due boards is polled within one rotation
+        (providers / 2 slots... claims) however large the other backlogs are.
+        Odd slots go to the provider holding the most overdue board, which
+        keeps big providers served in proportion to their backlog. The old
+        "largest backlog takes every slot" rule starved small providers.
+        """
         claimed: list[q.Board] = []
-        for provider in providers:
-            room = min(self.provider_limit(provider) - self._inflight[provider], free - len(claimed))
-            if room <= 0:
-                continue
+        exhausted: set[str] = set()
+        while len(claimed) < free:
+            open_ = [p for p in due if p not in exhausted
+                     and self._inflight[p] < self.provider_limit(p)]
+            if not open_:
+                break
+            if self._claim_seq % 2 == 0:
+                provider = min(open_, key=lambda p: (self._last_served.get(p, -1), due[p][0], due[p][1], p))
+            else:
+                provider = min(open_, key=lambda p: (due[p][1], p))
             with self.engine.begin() as conn:
-                boards = q.claim_boards(conn, provider, self.owner, room, self.cfg.board_lease)
+                boards = q.claim_boards(conn, provider, self.owner, 1, self.cfg.board_lease)
+            if not boards:
+                exhausted.add(provider)
+                continue
+            self._claim_seq += 1
+            self._last_served[provider] = self._claim_seq
             claimed.extend(boards)
             for b in boards:
                 with self._lock:
                     self._inflight[b.collector] += 1
                     self._boards[b.company_id] = b
-            if len(claimed) >= free:
-                break
         return claimed
 
     def collect_board(self, board: q.Board) -> str:
