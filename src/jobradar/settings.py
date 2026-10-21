@@ -20,6 +20,10 @@ class FilterSettings(BaseModel):
 
     us_only: bool = True
     max_posting_age_days: int | None = Field(default=None, ge=1)
+    # Also fresh: first seen by JobRadar within max_posting_age_days, published
+    # by the employer within this many days, and not part of a board's initial
+    # scan. None keeps the strict employer-date rule only.
+    max_discovery_age_days: int | None = Field(default=None, ge=1)
     require_explicit_sponsorship: bool = False
     # Reject a job whose *minimum* stated experience is above this many years.
     max_years_required: int = Field(default=4, ge=0)
@@ -40,6 +44,14 @@ class FilterSettings(BaseModel):
         "support engineer", "customer engineer", "field engineer", "mechanical", "electrical",
         "civil", "hardware", "manufacturing", "aerodynamics", "aerostructures", "recruiter",
     ]
+
+
+    @model_validator(mode="after")
+    def _discovery_covers_posting_window(self):
+        if (self.max_discovery_age_days is not None and self.max_posting_age_days is not None
+                and self.max_discovery_age_days < self.max_posting_age_days):
+            raise ValueError("max_discovery_age_days must be at least max_posting_age_days")
+        return self
 
 
 class Preferences(BaseModel):
@@ -115,9 +127,11 @@ class Settings(BaseModel):
 
     @model_validator(mode="after")
     def _ingestion_covers_alert_window(self):
-        window, alerts = self.ingestion.max_age_days, self.filters.max_posting_age_days
+        window = self.ingestion.max_age_days
+        alerts = self.filters.max_discovery_age_days or self.filters.max_posting_age_days
         if window is not None and alerts is not None and window < alerts:
-            raise ValueError("[ingestion] max_age_days must be at least [filters] max_posting_age_days, "
+            raise ValueError("[ingestion] max_age_days must be at least [filters] max_posting_age_days "
+                             "(and max_discovery_age_days), "
                              "or eligible postings would never be stored")
         return self
 

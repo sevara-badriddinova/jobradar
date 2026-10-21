@@ -11,7 +11,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from sqlalchemy import Text, case, column, func, literal, or_, select, text, update, values
+from sqlalchemy import Text, case, column, exists, func, literal, or_, select, text, update, values
 from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.engine import Connection
 
@@ -68,7 +68,7 @@ def _derived(job: Job) -> dict:
 def _find_original(conn: Connection, column, value: str):
     """Prefer a live canonical/reposted listing to a closed ancestor."""
     return conn.execute(
-        select(jobs_t.c.id, jobs_t.c.closed_at)
+        select(jobs_t.c.id, jobs_t.c.closed_at, jobs_t.c.source, jobs_t.c.board, jobs_t.c.source_job_id)
         .where(column == value, jobs_t.c.status != "DUPLICATE",
                or_(jobs_t.c.duplicate_of_id.is_(None), jobs_t.c.dedup_reason == "fingerprint"))
         .order_by(jobs_t.c.closed_at.is_not(None), jobs_t.c.id)
@@ -111,6 +111,12 @@ def snapshot_digest(source: str, jobs: list[Job], *, complete: bool, max_age_day
         h.update(b"\n")
         h.update(entry.encode())
     return h.hexdigest()
+
+
+def _is_initial_scan(conn: Connection, source: str, board: str, existing: dict) -> bool:
+    """No open postings stored for this board yet (index-only, ix_jobs_open_by_board)."""
+    return not existing and not conn.execute(select(exists().where(
+        jobs_t.c.source == source, jobs_t.c.board == board, jobs_t.c.closed_at.is_(None)))).scalar()
 
 
 def ingest_snapshot(
@@ -209,6 +215,12 @@ def ingest_snapshot(
                                  ]), None), else_=jobs_t.c.filtered_at)))
 
     # --- Unknown IDs: levels 2 and 3, then insert ---------------------------
+    # A board with no open postings yet is on its initial scan: everything it
+    # lists is backlog, not news (see recency.py). Index-only check
+    # (ix_jobs_open_by_board); a board whose postings all closed counts as
+    # initial too, which only errs towards fewer alerts.
+    backfill = _is_initial_scan(conn, source, board, existing)
+    listed = set(ids)
     for sid, job in snapshot.items():
         if sid in existing:
             continue
@@ -220,7 +232,12 @@ def ingest_snapshot(
         elif (hit := _find_original(conn, jobs_t.c.fingerprint, d["fingerprint"])):
             # Same company+title+location under a new ID. If the original is
             # gone it's a repost; if it's still open, it's a parallel listing.
-            status = "REPOSTED" if hit.closed_at is not None else "DUPLICATE"
+            # An original on this same board that this complete snapshot no
+            # longer lists is being closed right now (close detection runs
+            # below): that is a repost too, not a duplicate of a live posting.
+            leaving = (complete and hit.source == source and hit.board == board
+                       and hit.source_job_id not in listed)
+            status = "REPOSTED" if hit.closed_at is not None or leaving else "DUPLICATE"
             original_id, reason = hit.id, "fingerprint"
 
         new_id = conn.execute(
@@ -229,7 +246,8 @@ def ingest_snapshot(
                 source=source, board=board, source_job_id=sid, company=job.company,
                 title=job.title, location=job.location, url=job.url,
                 description=job.description, posted_at=job.posted_at, raw=job.raw,
-                status=status, duplicate_of_id=original_id, dedup_reason=reason, **d,
+                status=status, duplicate_of_id=original_id, dedup_reason=reason,
+                **({"discovered_in_backfill": True} if backfill else {}), **d,
             )
             .on_conflict_do_nothing(constraint="uq_jobs_source_job")
             .returning(jobs_t.c.id)

@@ -408,6 +408,7 @@ class Worker:
             settings = self.settings
             result = run_matching(self.engine, profile, settings.preferences, limit=len(tasks),
                                   max_posting_age_days=settings.filters.max_posting_age_days,
+                                  discovery_days=settings.filters.max_discovery_age_days,
                                   job_ids=[t.job_id for t in tasks], invalidate=False)
         except llm.BudgetExceeded as exc:
             # Keep every claimed task (no attempt charged). Jobs assessed before
@@ -450,7 +451,8 @@ class Worker:
     def _queue_notifications(self, conn, tasks: list[q.Task] = ()) -> int:
         settings = self.settings
         queued = enqueue_notifications(conn, settings.notifications,
-                                       max_posting_age_days=settings.filters.max_posting_age_days)
+                                       max_posting_age_days=settings.filters.max_posting_age_days,
+                                       discovery_days=settings.filters.max_discovery_age_days)
         for t in tasks:
             conn.execute(update(notifications).where(notifications.c.job_id == t.job_id,
                 notifications.c.origin_at.is_(None)).values(origin_at=t.origin_at))
@@ -470,6 +472,7 @@ class Worker:
             self.count("queue_updates")
             return queued
         policy = dict(max_posting_age_days=settings.filters.max_posting_age_days,
+                      discovery_days=settings.filters.max_discovery_age_days,
                       require_explicit_sponsorship=settings.filters.require_explicit_sponsorship)
         sent = send_immediate(self.engine, tg, chat_id, **policy)
         total, failed = sent.sent, sent.failed

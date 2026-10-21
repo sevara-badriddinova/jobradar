@@ -8,7 +8,9 @@
 us_only = true            # reject jobs whose every location is outside the US ("Remote" passes)
 max_years_required = 2   # reject when a job's *minimum* required experience is above this
 max_posting_age_days = 3 # known publication date within the last 72 hours
-require_explicit_sponsorship = true # the specific posting must offer immigration support
+max_discovery_age_days = 14 # also: first seen by JobRadar in the last 72 h, published within 14 days,
+                            # and not from a newly added board's initial scan
+require_explicit_sponsorship = true # explicit support -> AI; refusal -> rejected; not stated -> sponsorship review queue
 
 # Titles must contain at least one of these words/phrases. Uncomment to replace the default list:
 # title_must_include = ["engineer", "engineering", "developer", "software", "swe", "sde",

@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import case, func, literal, select, text, update
+from sqlalchemy import and_, case, func, literal, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Connection, Engine, Row
 
@@ -49,8 +49,12 @@ class SendResult:
 
 # --- 1. queue ------------------------------------------------------------------------
 
-def enqueue(conn: Connection, settings: NotificationSettings, *, max_posting_age_days=None) -> dict[str, int]:
-    """Queue every open matched job scoring at least the digest threshold. Idempotent."""
+def enqueue(conn: Connection, settings: NotificationSettings, *, max_posting_age_days=None,
+            discovery_days=None) -> dict[str, int]:
+    """Queue every open matched job scoring at least the digest threshold. Idempotent.
+
+    A repost of a role you were already alerted to, or acted on (applied,
+    ignored, ...), is not announced again under its new posting ID."""
     kind = case((jobs.c.match_score >= settings.immediate_min_score, "immediate"), else_="digest")
     # Reconcile pending rows with current scores; a cancelled, never-attempted
     # alert can become eligible after a corrected assessment. Sent/uncertain
@@ -67,7 +71,8 @@ def enqueue(conn: Connection, settings: NotificationSettings, *, max_posting_age
                      select(jobs.c.id, literal(CHANNEL), kind)
                      .where(jobs.c.status == "MATCHED", jobs.c.closed_at.is_(None),
                             jobs.c.match_score >= settings.digest_min_score, not_skipped(),
-                            recent_jobs(max_posting_age_days)))
+                            recent_jobs(max_posting_age_days, discovery_days=discovery_days),
+                            ~_already_announced_original()))
         .on_conflict_do_update(constraint="uq_notifications_job_channel",
             set_={"status": "pending", "kind": case(
                 (select(jobs.c.match_score).where(jobs.c.id == notifications.c.job_id).scalar_subquery()
@@ -80,11 +85,24 @@ def enqueue(conn: Connection, settings: NotificationSettings, *, max_posting_age
 
 # --- 2. send -------------------------------------------------------------------------
 
+def _already_announced_original():
+    """The job reposts (or duplicates) a role that was already sent or acted on."""
+    original = jobs.alias("original")
+    sent = select(notifications.c.id).where(notifications.c.job_id == jobs.c.duplicate_of_id,
+                                            notifications.c.status.in_(["sent", "sending"])).exists()
+    decided = select(job_reviews.c.job_id).where(
+        job_reviews.c.job_id == jobs.c.duplicate_of_id,
+        job_reviews.c.choice.in_(["IGNORED", "SPONSORSHIP", "APPLIED", "QUEUED"])).exists()
+    acted = select(original.c.id).where(original.c.id == jobs.c.duplicate_of_id,
+        original.c.status.in_(["NOTIFIED", "APPLIED", "REJECTED"])).exists()
+    return and_(jobs.c.duplicate_of_id.is_not(None), or_(sent, decided, acted))
+
+
 def _job(conn: Connection, job_id: int) -> Row:
     return conn.execute(
         select(jobs.c.id, jobs.c.company, jobs.c.title, jobs.c.location, jobs.c.url,
                jobs.c.first_seen_at, jobs.c.posted_at, jobs.c.closed_at, jobs.c.status, jobs.c.match_score,
-               jobs.c.description, jobs.c.fingerprint,
+               jobs.c.description, jobs.c.fingerprint, jobs.c.discovered_in_backfill,
                job_matches.c.assessment, job_reviews.c.choice)
         .outerjoin(job_matches, jobs.c.match_id == job_matches.c.id)
         .outerjoin(job_reviews, jobs.c.id == job_reviews.c.job_id)
@@ -109,7 +127,8 @@ def _mark_failed(conn: Connection, ids: list[int], error: TelegramError) -> None
 
 
 def send_immediate(engine: Engine, tg: Telegram, chat_id: str, now: datetime | None = None, *,
-                   max_posting_age_days=None, require_explicit_sponsorship=False) -> SendResult:
+                   max_posting_age_days=None, require_explicit_sponsorship=False,
+                   discovery_days=None) -> SendResult:
     result, failures_in_a_row = SendResult(), 0
     with engine.connect() as conn:
         ids = conn.execute(select(notifications.c.id).where(
@@ -127,7 +146,7 @@ def send_immediate(engine: Engine, tg: Telegram, chat_id: str, now: datetime | N
             if claimed is None:
                 continue  # another process took it
             job = _job(conn, claimed)
-            if not _eligible(job, max_posting_age_days, require_explicit_sponsorship, _kept(conn, job)):
+            if not _eligible(job, max_posting_age_days, require_explicit_sponsorship, _kept(conn, job), discovery_days):
                 conn.execute(update(notifications).where(notifications.c.id == notification_id)
                              .values(status="cancelled", attempts=notifications.c.attempts - 1))
                 result.cancelled += 1
@@ -155,7 +174,7 @@ def send_immediate(engine: Engine, tg: Telegram, chat_id: str, now: datetime | N
 
 
 def send_digest(engine: Engine, tg: Telegram, chat_id: str, *, max_posting_age_days=None,
-                require_explicit_sponsorship=False) -> SendResult:
+                require_explicit_sponsorship=False, discovery_days=None) -> SendResult:
     """Send every pending digest notification, grouped into as few messages as possible."""
     result = SendResult()
     with engine.begin() as conn:
@@ -169,7 +188,7 @@ def send_digest(engine: Engine, tg: Telegram, chat_id: str, *, max_posting_age_d
         items = []
         for row in claimed:
             job = _job(conn, row.job_id)
-            if not _eligible(job, max_posting_age_days, require_explicit_sponsorship, _kept(conn, job)):
+            if not _eligible(job, max_posting_age_days, require_explicit_sponsorship, _kept(conn, job), discovery_days):
                 conn.execute(update(notifications).where(notifications.c.id == row.id).values(
                     status="cancelled", attempts=notifications.c.attempts - 1))
                 result.cancelled += 1
@@ -212,12 +231,15 @@ CONSUMER_LOCK = 741863201
 
 
 def _eligible(job: Row, max_posting_age_days=None, require_explicit_sponsorship=False,
-              kept: bool = False) -> bool:
+              kept: bool = False, discovery_days=None) -> bool:
     """kept: the user kept this role from the sponsorship review queue, which
     stands in for explicit support (an explicit refusal still blocks it)."""
     return (job.closed_at is None and job.status == "MATCHED"
             and job.choice not in ("IGNORED", "SPONSORSHIP", "APPLIED")
-            and publication_reason(job.posted_at, max_posting_age_days) is None
+            and publication_reason(job.posted_at, max_posting_age_days,
+                                   first_seen_at=getattr(job, "first_seen_at", None),
+                                   backfill=getattr(job, "discovered_in_backfill", False),
+                                   discovery_days=discovery_days) is None
             and (not require_explicit_sponsorship or (
                 (kept or sponsorship_evidence(job.description) is not None)
                 and sponsorship_reason(job.description) is None)))

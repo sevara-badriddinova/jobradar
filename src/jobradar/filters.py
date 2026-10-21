@@ -12,7 +12,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import and_, case, func, or_, select, text, true, update
+from sqlalchemy import and_, case, func, not_, or_, select, text, true, update
 from sqlalchemy.engine import Connection
 from sqlalchemy.dialects.postgresql import insert
 
@@ -20,7 +20,7 @@ from jobradar.collectors import COLLECTORS
 from jobradar.db import jobs, app_state
 from jobradar.dedup import normalize_key
 from jobradar.settings import FilterSettings
-from jobradar.recency import publication_reason, recent_jobs
+from jobradar.recency import discovered_recently, publication_reason, recent_jobs
 from jobradar.query_fields import location_raw
 from jobradar.sponsorship_review import UNKNOWN_REASON, hold, kept_fingerprints, resolve
 
@@ -217,9 +217,10 @@ def location_reason(locations: list[str]) -> str | None:
 
 def reject_reason(*, source: str, title: str, location: str | None, description: str,
                   raw: dict, settings: FilterSettings, needs_sponsorship: bool = False,
-                  posted_at=None) -> str | None:
+                  posted_at=None, first_seen_at=None, backfill: bool = False) -> str | None:
     """Why this job should be rejected, or None if it passes every hard filter."""
-    if reason := publication_reason(posted_at, settings.max_posting_age_days):
+    if reason := publication_reason(posted_at, settings.max_posting_age_days, first_seen_at=first_seen_at,
+                                    backfill=backfill, discovery_days=settings.max_discovery_age_days):
         return reason
     if reason := title_reason(title, settings):
         return reason
@@ -287,7 +288,9 @@ def run_filters(conn: Connection, settings: FilterSettings, *, recheck: bool = F
             ("posting date: unavailable", jobs.c.posted_at.is_(None)),
             ("posting date: in the future", jobs.c.posted_at > now),
             (f"posting date: older than {settings.max_posting_age_days} days",
-             jobs.c.posted_at < now - timedelta(days=settings.max_posting_age_days)),
+             and_(jobs.c.posted_at < now - timedelta(days=settings.max_posting_age_days),
+                  not_(discovered_recently(settings.max_posting_age_days,
+                                           settings.max_discovery_age_days, now)))),
         ]
         # Once rejected for an old/missing date, a row needs no daily heap
         # scan. Ingestion clears filtered_at after date/content changes, and
@@ -309,7 +312,8 @@ def run_filters(conn: Connection, settings: FilterSettings, *, recheck: bool = F
             if count:
                 result.rejected[reason] += count
     if recheck:
-        pending = and_(active, recent_jobs(settings.max_posting_age_days, now))
+        pending = and_(active, recent_jobs(settings.max_posting_age_days, now,
+                                           settings.max_discovery_age_days))
     else:
         # Exactly the ix_jobs_pending_active predicate, nothing else: a posted_at
         # range here made PostgreSQL walk the date index over every recent open
@@ -321,14 +325,17 @@ def run_filters(conn: Connection, settings: FilterSettings, *, recheck: bool = F
     # Read small metadata first: excluded titles never need a description.
     cursor = 0
     while True:
-        rows = conn.execute(select(jobs.c.id, jobs.c.title, jobs.c.posted_at)
+        rows = conn.execute(select(jobs.c.id, jobs.c.title, jobs.c.posted_at, jobs.c.first_seen_at,
+                                   jobs.c.discovered_in_backfill)
                             .where(pending, jobs.c.id > cursor).order_by(jobs.c.id).limit(250)).all()
         if not rows:
             break
         cursor = rows[-1].id
         body_ids = []
         for row in rows:
-            reason = (publication_reason(row.posted_at, settings.max_posting_age_days, now)
+            reason = (publication_reason(row.posted_at, settings.max_posting_age_days, now,
+                                         first_seen_at=row.first_seen_at, backfill=row.discovered_in_backfill,
+                                         discovery_days=settings.max_discovery_age_days)
                       or title_reason(row.title, settings))
             if reason:
                 decisions.setdefault(reason, []).append(row.id)
@@ -336,12 +343,14 @@ def run_filters(conn: Connection, settings: FilterSettings, *, recheck: bool = F
                 body_ids.append(row.id)
         if body_ids:
             query = select(jobs.c.id, jobs.c.source, jobs.c.title, jobs.c.location, jobs.c.fingerprint,
-                           jobs.c.description, location_raw(), jobs.c.posted_at).where(jobs.c.id.in_(body_ids))
+                           jobs.c.description, location_raw(), jobs.c.posted_at, jobs.c.first_seen_at,
+                           jobs.c.discovered_in_backfill).where(jobs.c.id.in_(body_ids))
             held = []
             for row in conn.execute(query):
                 reason = reject_reason(source=row.source, title=row.title, location=row.location,
                     description=row.description, raw=row.raw, settings=settings,
-                    needs_sponsorship=needs_sponsorship, posted_at=row.posted_at)
+                    needs_sponsorship=needs_sponsorship, posted_at=row.posted_at,
+                    first_seen_at=row.first_seen_at, backfill=row.discovered_in_backfill)
                 if reason == UNKNOWN_REASON:
                     held.append(row)
                 else:

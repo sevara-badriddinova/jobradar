@@ -208,7 +208,10 @@ def test_cli_lists_keeps_and_dismisses(engine, db_env, capsys):
 
 # --- migration 0014 data step -----------------------------------------------------------------
 
-def test_migration_requeues_recent_no_explicit_rejections_only(scratch):
+def test_migration_requeues_recent_no_explicit_rejections_only(scratch, monkeypatch):
+    # Rows are ingested into an older schema with today's code: leave out the
+    # newer discovered_in_backfill column (written only for initial scans).
+    monkeypatch.setattr("jobradar.repository._is_initial_scan", lambda *a: False)
     from alembic import command
     from alembic.config import Config
     from jobradar.db import migrate

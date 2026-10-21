@@ -248,7 +248,8 @@ def cmd_match(args) -> int:
     llm.set_meter(DailyBudgetMeter(engine, budget_from_env()))  # records spend; caps when configured
     try:
         result = run_matching(engine, profile, preferences, limit=args.limit, rematch=args.rematch,
-                              max_posting_age_days=settings.filters.max_posting_age_days)
+                              max_posting_age_days=settings.filters.max_posting_age_days,
+                              discovery_days=settings.filters.max_discovery_age_days)
     except llm.BudgetExceeded as exc:
         print(f"{exc}; remaining jobs stay queued for tomorrow", file=sys.stderr)
         return 0
@@ -315,7 +316,8 @@ def prepare_delivery(engine, chat_id, profile_settings) -> dict:
         if profile is not None:
             from jobradar.matcher import invalidate_stale_matches
             invalidate_stale_matches(conn, profile, profile_settings.preferences)
-        queued = enqueue(conn, settings, max_posting_age_days=max_age)
+        queued = enqueue(conn, settings, max_posting_age_days=max_age,
+                         discovery_days=profile_settings.filters.max_discovery_age_days)
         if settings.delivery == "queue":
             request_queue(conn, chat_id, min_score=settings.digest_min_score, publish=True,
                           max_posting_age_days=max_age)
@@ -393,6 +395,7 @@ def cmd_notify(args) -> int:
             print(f"queue update saved: {queued['immediate'] + queued['digest']} new job(s)")
             return 0
         policy = dict(max_posting_age_days=max_age,
+                      discovery_days=profile_settings.filters.max_discovery_age_days,
                       require_explicit_sponsorship=profile_settings.filters.require_explicit_sponsorship)
         sent = send_immediate(engine, tg, chat_id, **policy)
         digest = send_digest(engine, tg, chat_id, **policy) if args.digest else None

@@ -68,6 +68,9 @@ jobs = Table(
     Column("applied_at", TS),
     Column("filtered_at", TS),     # set once hard filters have looked at the job
     Column("filter_reason", Text),  # why it was rejected (status FILTERED)
+    # Found by its board's first scan (the backlog, not a new listing): only the
+    # employer's publication date can make it fresh. See recency.py.
+    Column("discovered_in_backfill", Boolean, nullable=False, server_default=text("false")),
     Column("raw", JSONB, nullable=False),
     # Level-1 dedup + idempotency: the database, not application code,
     # guarantees one row per source posting even under retries/races.

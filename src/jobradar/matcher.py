@@ -269,7 +269,8 @@ class MatchResult:
 
 def run_matching(engine: Engine, profile: Row, preferences: Preferences, *,
                  limit: int = 25, rematch: bool = False, max_posting_age_days: int | None = None,
-                 job_ids: list[int] | None = None, invalidate: bool = True) -> MatchResult:
+                 job_ids: list[int] | None = None, invalidate: bool = True,
+                 discovery_days: int | None = None) -> MatchResult:
     """Assess up to `limit` jobs that passed the hard filters (newest first).
 
     rematch=True also revisits MATCHED jobs, e.g. after editing preferences or
@@ -288,7 +289,7 @@ def run_matching(engine: Engine, profile: Row, preferences: Preferences, *,
                    job_matches.c.context_hash.label("stored_context"))
             .outerjoin(job_matches, jobs.c.match_id == job_matches.c.id)
             .where(jobs.c.status.in_(statuses if rematch else ["DISCOVERED", "REPOSTED"]), jobs.c.filtered_at.is_not(None), jobs.c.closed_at.is_(None), not_skipped(),
-                   recent_jobs(max_posting_age_days), scope)
+                   recent_jobs(max_posting_age_days, discovery_days=discovery_days), scope)
             .order_by(jobs.c.status == "MATCHED", jobs.c.first_seen_at.desc(), jobs.c.id.desc())
             .limit(max(0, limit))
         ).all()
@@ -324,7 +325,7 @@ def run_matching(engine: Engine, profile: Row, preferences: Preferences, *,
                     or context_hash(profile.id, preferences, current, profile.profile) != key):
                 continue  # job changed/closed while the model was running
             conn.execute(update(jobs).where(jobs.c.id == job.id, jobs.c.status.in_(statuses), not_skipped(),
-                                           recent_jobs(max_posting_age_days))
+                                           recent_jobs(max_posting_age_days, discovery_days=discovery_days))
                          .values(status="MATCHED", match_score=match_score, match_id=match_id))
     return result
 
