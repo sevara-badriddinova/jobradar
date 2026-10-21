@@ -333,6 +333,35 @@ def deliver_queue_mode(engine, tg, chat_id, profile_settings) -> int:
     return queued["immediate"] + queued["digest"]
 
 
+def cmd_sponsorship_review(args) -> int:
+    """The held-for-review queue: roles that neither offer nor refuse sponsorship."""
+    from jobradar import queue as work
+    from jobradar import sponsorship_review as review
+    engine = make_engine()
+    with engine.begin() as conn:
+        try:
+            for review_id in args.keep or []:
+                job_id = review.decide(conn, review_id, "kept")
+                if job_id is not None:
+                    work.enqueue(conn, "match", [job_id])
+                print(f"#{review_id} kept" + (f": job {job_id} queued for matching" if job_id else ""))
+            for review_id in args.dismiss or []:
+                review.decide(conn, review_id, "dismissed")
+                print(f"#{review_id} dismissed")
+        except LookupError as exc:
+            print(exc, file=sys.stderr)
+            return 1
+        rows = review.pending(conn, args.limit)
+        totals = review.counts(conn)
+    print(f"sponsorship review: {totals.get('pending', 0)} pending, {totals.get('kept', 0)} kept, "
+          f"{totals.get('dismissed', 0)} dismissed")
+    for r in rows:
+        posted = r.posted_at.strftime("%Y-%m-%d") if r.posted_at else "undated"
+        print(f"#{r.id:<6} {posted}  {r.company[:28]:<28} {r.title[:60]:<60} {(r.location or '-')[:30]}\n"
+              f"        {r.url}")
+    return 0
+
+
 def cmd_notify(args) -> int:
     try:
         profile_settings = load_settings(args.profile)
@@ -798,6 +827,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--min-score", type=float, default=70)
     p.add_argument("--limit", type=int, default=20)
     p.set_defaults(func=cmd_top)
+
+    p = sub.add_parser("sponsorship-review",
+                       help="roles held because the posting neither offers nor refuses visa sponsorship")
+    p.add_argument("--limit", type=positive_int, default=50)
+    p.add_argument("--keep", type=int, nargs="+", metavar="ID",
+                   help="keep: AI-score this role and alert on a good match")
+    p.add_argument("--dismiss", type=int, nargs="+", metavar="ID", help="dismiss (stays dismissed if reposted)")
+    p.set_defaults(func=cmd_sponsorship_review)
 
     p = sub.add_parser("notify", help="send Telegram alerts for new matches and apply button presses")
     p.add_argument("--digest", action="store_true", help="also send the digest of lower-scoring matches")

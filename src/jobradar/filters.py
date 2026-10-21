@@ -22,6 +22,7 @@ from jobradar.dedup import normalize_key
 from jobradar.settings import FilterSettings
 from jobradar.recency import publication_reason, recent_jobs
 from jobradar.query_fields import location_raw
+from jobradar.sponsorship_review import UNKNOWN_REASON, hold, kept_fingerprints, resolve
 
 log = logging.getLogger(__name__)
 
@@ -226,12 +227,15 @@ def reject_reason(*, source: str, title: str, location: str | None, description:
     if years is not None and years > settings.max_years_required:
         return f"experience: requires {years}+ years"
     if needs_sponsorship and (reason := sponsorship_reason(description)):
-        return reason
-    if settings.require_explicit_sponsorship and not sponsorship_evidence(description):
-        return "visa: no explicit sponsorship or STEM OPT support in this posting"
+        return reason                                   # explicit refusal: rejected
     if settings.us_only:
         extra = COLLECTORS[source].locations(raw) if source in COLLECTORS else []
-        return location_reason([loc for loc in [location, *extra] if loc])
+        if reason := location_reason([loc for loc in [location, *extra] if loc]):
+            return reason
+    if settings.require_explicit_sponsorship and not sponsorship_evidence(description):
+        # Neither support nor refusal: held for the user's review (no AI, no
+        # alert). Last, so only jobs that pass every other filter are held.
+        return UNKNOWN_REASON
     return None
 
 
@@ -331,20 +335,32 @@ def run_filters(conn: Connection, settings: FilterSettings, *, recheck: bool = F
             else:
                 body_ids.append(row.id)
         if body_ids:
-            query = select(jobs.c.id, jobs.c.source, jobs.c.title, jobs.c.location,
+            query = select(jobs.c.id, jobs.c.source, jobs.c.title, jobs.c.location, jobs.c.fingerprint,
                            jobs.c.description, location_raw(), jobs.c.posted_at).where(jobs.c.id.in_(body_ids))
+            held = []
             for row in conn.execute(query):
                 reason = reject_reason(source=row.source, title=row.title, location=row.location,
                     description=row.description, raw=row.raw, settings=settings,
                     needs_sponsorship=needs_sponsorship, posted_at=row.posted_at)
-                decisions.setdefault(reason, []).append(row.id)
+                if reason == UNKNOWN_REASON:
+                    held.append(row)
+                else:
+                    decisions.setdefault(reason, []).append(row.id)
+            kept = kept_fingerprints(conn, [r.fingerprint for r in held])
+            for row in held:   # the user kept this role from the review queue: normal pipeline
+                decisions.setdefault(None if row.fingerprint in kept else UNKNOWN_REASON, []).append(row.id)
 
     for reason, ids in decisions.items():
         # Passing keeps MATCHED jobs matched; only FILTERED ones come back as DISCOVERED.
         status = case((jobs.c.status == "FILTERED", "DISCOVERED"), else_=jobs.c.status) if reason is None else "FILTERED"
         for start in range(0, len(ids), 500):
-            conn.execute(update(jobs).where(jobs.c.id.in_(ids[start:start + 500])).values(
+            chunk = ids[start:start + 500]
+            conn.execute(update(jobs).where(jobs.c.id.in_(chunk)).values(
                 status=status, filter_reason=reason, filtered_at=func.now()))
+            if reason == UNKNOWN_REASON:
+                hold(conn, chunk)
+            else:
+                resolve(conn, chunk, reason or "passed")
         if reason is None:
             result.passed = len(ids)
             result.passed_ids = list(ids)

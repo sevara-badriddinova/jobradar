@@ -304,6 +304,32 @@ work_queue = Table(
           postgresql_where=text("state <> 'dead'")),
 )
 
+# Fresh jobs that pass every hard filter but neither offer nor refuse visa
+# sponsorship. Held for the user to review: never AI-scored, never alerted.
+# One row per fingerprint (company, title, location), so a repost of the same
+# role updates the existing entry and a dismissed role stays dismissed.
+sponsorship_reviews = Table(
+    "sponsorship_reviews",
+    metadata,
+    Column("id", BigInteger, Identity(), primary_key=True),
+    Column("fingerprint", Text, nullable=False),
+    Column("job_id", BigInteger, ForeignKey("jobs.id", ondelete="SET NULL")),
+    Column("company", Text, nullable=False),
+    Column("title", Text, nullable=False),
+    Column("location", Text),
+    Column("url", Text, nullable=False),
+    Column("posted_at", TS),
+    Column("first_seen_at", TS, nullable=False, server_default=func.now()),
+    Column("last_seen_at", TS, nullable=False, server_default=func.now()),
+    Column("state", Text, nullable=False, server_default="pending"),
+    Column("resolution", Text),
+    Column("decided_at", TS),
+    UniqueConstraint("fingerprint", name="uq_sponsorship_reviews_fingerprint"),
+    CheckConstraint("state IN ('pending','kept','dismissed','resolved')", name="ck_sponsorship_reviews_state"),
+    Index("ix_sponsorship_reviews_job", "job_id"),
+    Index("ix_sponsorship_reviews_pending", "last_seen_at", postgresql_where=text("state = 'pending'")),
+)
+
 # Daily AI spend ledger (UTC days) behind the matching budget cap.
 ai_usage = Table(
     "ai_usage",

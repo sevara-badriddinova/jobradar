@@ -24,6 +24,7 @@ from sqlalchemy.engine import Connection, Engine, Row
 from jobradar.applications import record
 from jobradar.db import app_state, feedback, job_matches, job_reviews, jobs, notifications
 from jobradar.filters import sponsorship_evidence, sponsorship_reason
+from jobradar.sponsorship_review import kept_fingerprints
 from jobradar.recency import publication_reason, recent_jobs
 from jobradar.review import not_skipped, remaining, set_choice
 from jobradar.queue_ui import parse_callback, read_state, request_queue, sync_queue
@@ -83,7 +84,7 @@ def _job(conn: Connection, job_id: int) -> Row:
     return conn.execute(
         select(jobs.c.id, jobs.c.company, jobs.c.title, jobs.c.location, jobs.c.url,
                jobs.c.first_seen_at, jobs.c.posted_at, jobs.c.closed_at, jobs.c.status, jobs.c.match_score,
-               jobs.c.description,
+               jobs.c.description, jobs.c.fingerprint,
                job_matches.c.assessment, job_reviews.c.choice)
         .outerjoin(job_matches, jobs.c.match_id == job_matches.c.id)
         .outerjoin(job_reviews, jobs.c.id == job_reviews.c.job_id)
@@ -126,7 +127,7 @@ def send_immediate(engine: Engine, tg: Telegram, chat_id: str, now: datetime | N
             if claimed is None:
                 continue  # another process took it
             job = _job(conn, claimed)
-            if not _eligible(job, max_posting_age_days, require_explicit_sponsorship):
+            if not _eligible(job, max_posting_age_days, require_explicit_sponsorship, _kept(conn, job)):
                 conn.execute(update(notifications).where(notifications.c.id == notification_id)
                              .values(status="cancelled", attempts=notifications.c.attempts - 1))
                 result.cancelled += 1
@@ -168,7 +169,7 @@ def send_digest(engine: Engine, tg: Telegram, chat_id: str, *, max_posting_age_d
         items = []
         for row in claimed:
             job = _job(conn, row.job_id)
-            if not _eligible(job, max_posting_age_days, require_explicit_sponsorship):
+            if not _eligible(job, max_posting_age_days, require_explicit_sponsorship, _kept(conn, job)):
                 conn.execute(update(notifications).where(notifications.c.id == row.id).values(
                     status="cancelled", attempts=notifications.c.attempts - 1))
                 result.cancelled += 1
@@ -210,12 +211,20 @@ FEEDBACK_ACTIONS = {"applied": ("APPLIED", "✅ Marked as applied"),
 CONSUMER_LOCK = 741863201
 
 
-def _eligible(job: Row, max_posting_age_days=None, require_explicit_sponsorship=False) -> bool:
+def _eligible(job: Row, max_posting_age_days=None, require_explicit_sponsorship=False,
+              kept: bool = False) -> bool:
+    """kept: the user kept this role from the sponsorship review queue, which
+    stands in for explicit support (an explicit refusal still blocks it)."""
     return (job.closed_at is None and job.status == "MATCHED"
             and job.choice not in ("IGNORED", "SPONSORSHIP", "APPLIED")
             and publication_reason(job.posted_at, max_posting_age_days) is None
             and (not require_explicit_sponsorship or (
-                sponsorship_evidence(job.description) is not None and sponsorship_reason(job.description) is None)))
+                (kept or sponsorship_evidence(job.description) is not None)
+                and sponsorship_reason(job.description) is None)))
+
+
+def _kept(conn: Connection, job: Row) -> bool:
+    return bool(kept_fingerprints(conn, [getattr(job, "fingerprint", None)]))
 
 
 def process_updates(engine: Engine, tg: Telegram, chat_id: str, timeout: int = 0) -> int:
