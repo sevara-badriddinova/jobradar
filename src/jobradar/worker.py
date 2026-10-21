@@ -89,6 +89,7 @@ class WorkerConfig:
     metrics_interval: float = 60.0
     heartbeat_interval: float = 300.0          # watchdog alerts after 30 stale minutes
     keeper_interval: float = 60.0
+    due_cache_seconds: float = 10.0
     shutdown_timeout: float = 90.0
 
 
@@ -130,6 +131,7 @@ class Worker:
         self._match_fail_streak = 0
         self._notify_fail_streak = 0
         self._backlog = (0, 0, 0.0)                   # filter, match, measured at
+        self._due_cache: tuple[dict[str, int], float] = ({}, -1e18)
 
     # --- small helpers ----------------------------------------------------------------
     def count(self, key: str, n: int = 1) -> None:
@@ -166,8 +168,30 @@ class Worker:
         still have capacity, most overdue first within each provider."""
         if free <= 0:
             return []
-        with self.engine.begin() as conn:
-            due = q.due_providers(conn)
+        # The per-provider due count only orders providers (the claim itself
+        # re-checks due/lease), so a few seconds of staleness is harmless. It
+        # aggregates the whole schedule (~260 ms on the VM): don't run it per claim.
+        due, at = self._due_cache
+        fresh = time.monotonic() - at > self.cfg.due_cache_seconds
+        if fresh:
+            with self.engine.begin() as conn:
+                due = q.due_providers(conn)
+            self._due_cache = (due, time.monotonic())
+        claimed = self._claim_from(due, free)
+        if not claimed and not fresh and self._spare_capacity(due):
+            # Nothing came from the cached providers although slots are free:
+            # the cached view may be stale (e.g. other providers became due).
+            with self.engine.begin() as conn:
+                due = q.due_providers(conn)
+            self._due_cache = (due, time.monotonic())
+            claimed = self._claim_from(due, free)
+        return claimed
+
+    def _spare_capacity(self, due: dict[str, int]) -> bool:
+        """True unless every cached due provider is already at its concurrency cap."""
+        return not due or any(self._inflight[p] < self.provider_limit(p) for p in due)
+
+    def _claim_from(self, due: dict[str, int], free: int) -> list[q.Board]:
         providers = sorted(due, key=lambda p: -due[p])
         claimed: list[q.Board] = []
         for provider in providers:
@@ -199,7 +223,8 @@ class Worker:
                                                    client=self.http)
                 report = run_collector(self.engine, collector, after_ingest=queue_filters,
                                        record_unchanged=False,
-                                       ingest_max_age_days=self.settings.ingestion.max_age_days)
+                                       ingest_max_age_days=self.settings.ingestion.max_age_days,
+                                       known_snapshot=board.snapshot_hash)
                 nbytes = meter.total
                 pressured = meter.backpressure
         except BackpressureError:
@@ -221,7 +246,8 @@ class Worker:
                 else:
                     kept = q.finish_board(conn, board, self.owner, ok=report.ok, error=report.error,
                                           fetched=report.fetched, nbytes=nbytes,
-                                          base_interval=self.cfg.base_interval)
+                                          base_interval=self.cfg.base_interval,
+                                          snapshot_hash=report.snapshot_hash)
                     outcome = "ok" if report.ok else "failed"
             if not kept:
                 outcome = "lost"
@@ -231,6 +257,8 @@ class Worker:
                 self._boards.pop(board.company_id, None)
             self.wake["slot"].set()   # a provider slot opened: claim the next board now
         self.count(f"collect_{outcome}")
+        if report is not None and report.unchanged:
+            self.count("collect_unchanged_skipped")
         if report is not None and report.result is not None and report.result.skipped_old:
             self.count("ingest_skipped_old", report.result.skipped_old)
         if outcome == "ok":
@@ -498,8 +526,9 @@ class Worker:
             except Exception:
                 log.exception("board discovery failed")
         if force or self.due("link", self.cfg.link_interval):
-            with self.engine.begin() as conn:
+            with self.engine.begin() as conn:   # own transaction: commits its progress cursor
                 link_applications(conn)
+            with self.engine.begin() as conn:
                 profile = refresh_experience(conn)
                 if profile is not None:
                     invalidate_stale_matches(conn, profile, self.settings.preferences)

@@ -278,3 +278,27 @@ def test_workday_real_change_is_still_detected(engine):
 def _rows(engine):
     with engine.connect() as conn:
         return conn.execute(select(jobs_t)).all()
+
+
+def test_known_details_skip_listing_only_rows_but_keep_undated_details(engine):
+    """Only rows that ever had details are read (avoids de-TOASTing every
+    listing-only Workday payload), including details without a startDate."""
+    from jobradar.pipeline import _known_details
+    from jobradar.repository import ingest_snapshot
+
+    def wd(sid, info, description=""):
+        job = make_job(sid, source="workday", description=description, posted_at=None)
+        raw = {"externalPath": sid, **({"jobPostingInfo": info} if info is not None else {})}
+        return job.model_copy(update={"raw": raw, "posted_at": None})
+
+    jobs = [wd("listing-only", None),
+            wd("dated", {"title": "T", "startDate": "2026-10-19"}),
+            wd("undated-details", {"title": "T"}, description="Real description")]
+    jobs[1] = jobs[1].model_copy(update={"posted_at": datetime(2026, 10, 19, tzinfo=UTC)})
+    with engine.begin() as conn:
+        ingest_snapshot(conn, source="workday", board="acme", jobs=jobs)
+
+    class C:
+        source, board, reuses_known_details = "workday", "acme", "jobPostingInfo"
+    known = _known_details(engine, C())
+    assert set(known) == {"dated", "undated-details"}

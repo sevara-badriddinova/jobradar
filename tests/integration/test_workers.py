@@ -428,3 +428,109 @@ def test_requeue_cli(engine, db_env, capsys):
     assert [t.job_id for t in tasks(engine, "filter")] == [job]
     assert cli.main(["requeue", "filter"]) == 0                 # all unfiltered: still one task
     assert len(tasks(engine, "filter")) == 1
+
+
+class TestSnapshotSkip:
+    """Identical polls skip ingestion; anything that would change the database does not."""
+
+    def jobs_xmin(self, engine):
+        with engine.connect() as conn:
+            return dict(conn.execute(text("SELECT source_job_id, xmin::text FROM jobs")).all())
+
+    def snapshot(self, engine):
+        with engine.connect() as conn:
+            return conn.execute(select(board_state.c.snapshot_hash, board_state.c.snapshot_at)).one()
+
+    def test_identical_poll_skips_ingestion_and_changes_are_ingested(self, engine, boards):
+        add_board(engine, "acme")
+        boards.snapshots["acme"] = [fresh("a"), fresh("b")]
+        w = make_worker(engine, boards)
+        assert poll(w, engine) == ["ok"]
+        first = self.snapshot(engine)
+        assert first.snapshot_hash and w.counters["collect_unchanged_skipped"] == 0
+        before = self.jobs_xmin(engine)
+
+        make_due(engine)
+        assert poll(w, engine) == ["ok"]
+        assert w.counters["collect_unchanged_skipped"] == 1
+        assert self.jobs_xmin(engine) == before and self.snapshot(engine) == first
+
+        # A changed description, a new posting, and a removed posting are all ingested.
+        boards.snapshots["acme"] = [fresh("a", description="Now in Rust."), fresh("c")]
+        make_due(engine)
+        assert poll(w, engine) == ["ok"]
+        assert w.counters["collect_unchanged_skipped"] == 1
+        assert row(engine, "b").closed_at is not None and row(engine, "c") is not None
+        assert row(engine, "a").description == "Now in Rust."
+        assert self.snapshot(engine).snapshot_hash != first.snapshot_hash
+
+    def test_volatile_workday_label_does_not_defeat_the_skip(self, engine, boards):
+        add_board(engine, "acme", collector="workday")
+        job = make_job("w1", source="workday")
+        boards.snapshots["acme"] = [job.model_copy(update={"raw": {"id": "w1", "postedOn": "Posted 4 Days Ago"}})]
+        w = make_worker(engine, boards)
+        poll(w, engine)
+        boards.snapshots["acme"] = [job.model_copy(update={"raw": {"id": "w1", "postedOn": "Posted 5 Days Ago"}})]
+        make_due(engine)
+        poll(w, engine)
+        assert w.counters["collect_unchanged_skipped"] == 1
+
+    def test_stale_digest_forces_a_full_ingest(self, engine, boards):
+        add_board(engine, "acme")
+        boards.snapshots["acme"] = [fresh("a")]
+        w = make_worker(engine, boards)
+        poll(w, engine)
+        with engine.begin() as conn:  # a day old: no longer trusted
+            conn.execute(update(board_state).values(snapshot_at=func.now() - timedelta(hours=25)))
+        make_due(engine)
+        poll(w, engine)
+        assert w.counters["collect_unchanged_skipped"] == 0
+        assert self.snapshot(engine).snapshot_at > datetime.now(UTC) - timedelta(minutes=5)
+
+    def test_failed_or_empty_polls_never_store_a_digest(self, engine, boards):
+        add_board(engine, "acme")
+        boards.snapshots["acme"] = []
+        w = make_worker(engine, boards)
+        poll(w, engine)
+        assert self.snapshot(engine).snapshot_hash is None
+        boards.snapshots["acme"] = CollectorError("HTTP 503")
+        make_due(engine)
+        poll(w, engine)
+        assert self.snapshot(engine).snapshot_hash is None
+
+    def test_digest_ignores_order_but_not_the_ingestion_window(self):
+        from jobradar.repository import snapshot_digest
+        a, b = fresh("a"), fresh("b")
+        assert snapshot_digest("greenhouse", [a, b], complete=True, max_age_days=30) == \
+            snapshot_digest("greenhouse", [b, a], complete=True, max_age_days=30)
+        assert snapshot_digest("greenhouse", [a, b], complete=True, max_age_days=30) != \
+            snapshot_digest("greenhouse", [a, b], complete=True, max_age_days=60)
+        assert snapshot_digest("greenhouse", [], complete=True, max_age_days=30) is None
+
+
+def test_identical_listing_from_a_real_collector_skips_normalization_and_succeeds(engine):
+    """End to end through run_collector with a base-class collector (normalize_all)."""
+    from jobradar.collectors.base import JobCollector
+    from jobradar.models import Job
+    from jobradar.pipeline import run_collector
+
+    class Board(JobCollector):
+        source = "greenhouse"
+        normalized = 0
+
+        def collect(self):
+            return self.normalize_all([{"id": 1, "title": "Backend Engineer"}, {"id": 2, "title": "Data Engineer"}])
+
+        def normalize(self, raw):
+            Board.normalized += 1
+            return Job(source="greenhouse", source_job_id=str(raw["id"]), company="Acme", title=raw["title"],
+                       location=None, url=f"https://x/{raw['id']}", description="d", posted_at=None, raw=raw)
+
+    first = run_collector(engine, Board("acme", company="Acme"), record_unchanged=False)
+    assert first.ok and first.snapshot_hash and Board.normalized == 2
+    second = run_collector(engine, Board("acme", company="Acme"), record_unchanged=False,
+                           known_snapshot=first.snapshot_hash)
+    assert second.ok and second.error is None and second.unchanged
+    assert second.fetched == 2 and second.snapshot_hash is None and Board.normalized == 2
+    with engine.connect() as conn:   # unchanged success writes no history row
+        assert conn.execute(select(func.count()).select_from(collector_runs)).scalar_one() == 1

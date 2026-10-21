@@ -10,7 +10,11 @@ cd /opt/jobradar
 wait_poll() {
   systemctl stop jobradar-poll.timer
   for _ in $(seq 1 360); do
-    systemctl is-active --quiet jobradar-poll.service || return 0
+    # A running oneshot cycle reports "activating", which is-active treats as not active.
+    case $(systemctl show -p ActiveState --value jobradar-poll.service) in
+      active|activating|deactivating|reloading) ;;
+      *) return 0 ;;
+    esac
     sleep 10   # never interrupt a running legacy cycle
   done
   echo 'legacy cycle still running after an hour; aborting' >&2; exit 1

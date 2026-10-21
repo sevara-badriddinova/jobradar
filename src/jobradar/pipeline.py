@@ -1,17 +1,19 @@
 """Run collectors with failure isolation and record every run."""
 
+import json
 import logging
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import func, insert, or_, select, update
 from sqlalchemy.engine import Engine
 
-from jobradar.collectors.base import JobCollector
+from jobradar.collectors.base import JobCollector, UnchangedSnapshot
+from jobradar.dedup import description_hash
 from jobradar.db import collector_runs
 from jobradar.db import jobs as jobs_t
-from jobradar.repository import IngestResult, ingest_snapshot
+from jobradar.repository import IngestResult, ingest_snapshot, snapshot_digest
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +28,8 @@ class RunReport:
     error: str | None = None
     seconds: float = 0.0
     queued: int = 0          # filter tasks queued by the workers' after_ingest hook
+    unchanged: bool = False  # identical to the last ingested snapshot: nothing written
+    snapshot_hash: str | None = None  # digest of a snapshot ingested by this call
 
 
 def _known_details(engine: Engine, collector: JobCollector) -> dict[str, dict]:
@@ -33,14 +37,21 @@ def _known_details(engine: Engine, collector: JobCollector) -> dict[str, dict]:
     open postings, so the collector can skip re-fetching them."""
     key = collector.reuses_known_details
     with engine.connect() as conn:
+        # A posting that ever had details fetched has a publication date or a
+        # non-empty description (both in the uncompressed heap row). Testing
+        # those first avoids de-TOASTing the payload of every listing-only
+        # posting (most Workday rows) on every poll.
+        hydrated = or_(jobs_t.c.posted_at.is_not(None),
+                       jobs_t.c.description_hash != description_hash(""))
         rows = conn.execute(select(jobs_t.c.source_job_id, jobs_t.c.raw[key]).where(
             jobs_t.c.source == collector.source, jobs_t.c.board == collector.board,
-            jobs_t.c.closed_at.is_(None), jobs_t.c.raw.has_key(key)))
+            jobs_t.c.closed_at.is_(None), hydrated, jobs_t.c.raw.has_key(key)))
         return {sid: {key: value} for sid, value in rows if isinstance(value, dict)}
 
 
 def run_collector(engine: Engine, collector: JobCollector, *, after_ingest=None,
-                  record_unchanged: bool = True, ingest_max_age_days: int | None = None) -> RunReport:
+                  record_unchanged: bool = True, ingest_max_age_days: int | None = None,
+                  known_snapshot: str | None = None) -> RunReport:
     """Collect and ingest one board. `after_ingest(conn, report)` runs inside the
     ingest transaction (the workers queue filter tasks there, atomically).
 
@@ -48,6 +59,10 @@ def run_collector(engine: Engine, collector: JobCollector, *, after_ingest=None,
     for failures and polls that changed something; board_state keeps the latest
     outcome of every board, so the history table does not grow by ~200k
     no-op rows a day.
+
+    known_snapshot: digest of this board's last ingested snapshot. A poll with
+    the same digest skips ingestion (no reads or writes of jobs); a different
+    one is ingested and its digest returned in report.snapshot_hash.
     """
     source, board = collector.source, collector.board
     started = time.monotonic()
@@ -67,13 +82,32 @@ def run_collector(engine: Engine, collector: JobCollector, *, after_ingest=None,
     try:
         if getattr(collector, "reuses_known_details", None):
             collector.known = _known_details(engine, collector)
-        jobs = collector.collect()
-        report.fetched = len(jobs)
-        with engine.begin() as conn:
-            report.result = ingest_snapshot(conn, source=source, board=board, jobs=jobs,
-                                            complete=collector.complete_snapshot, skip_new=skip_new)
-            if after_ingest is not None:
-                after_ingest(conn, report)
+        collector.known_digest = known_snapshot   # base collectors: skip normalizing an identical listing
+        collector.digest_salt = json.dumps({"max_age_days": ingest_max_age_days})
+        try:
+            jobs = collector.collect()
+        except UnchangedSnapshot as same:   # `same` is unbound after this block
+            jobs = None
+            report.fetched = same.records
+        if jobs is None:
+            report.unchanged = True
+            report.result = IngestResult(seen=report.fetched)
+            digest = None
+        else:
+            report.fetched = len(jobs)
+            # Record-level digest from base collectors; otherwise one over the Jobs.
+            digest = getattr(collector, "snapshot_digest", None) or snapshot_digest(
+                source, jobs, complete=collector.complete_snapshot, max_age_days=ingest_max_age_days)
+        if jobs is not None and digest is not None and digest == known_snapshot:
+            report.unchanged = True
+            report.result = IngestResult(seen=len(jobs))
+        elif jobs is not None:
+            with engine.begin() as conn:
+                report.result = ingest_snapshot(conn, source=source, board=board, jobs=jobs,
+                                                complete=collector.complete_snapshot, skip_new=skip_new)
+                if after_ingest is not None:
+                    after_ingest(conn, report)
+            report.snapshot_hash = digest
         report.ok = True
     except Exception as exc:  # boundary: one board's failure must not stop the rest
         report.error = f"{type(exc).__name__}: {exc}"

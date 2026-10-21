@@ -7,8 +7,11 @@ so a role you applied to is never suggested again.
 """
 
 import difflib
+import hashlib
+import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -16,7 +19,7 @@ from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Connection
 
-from jobradar.db import applications, feedback, jobs
+from jobradar.db import app_state, applications, feedback, jobs
 from jobradar.dedup import company_key, normalize_key
 
 log = logging.getLogger(__name__)
@@ -94,13 +97,48 @@ def _same_company_jobs(grouped: dict[str, list], key: str) -> list:
     return [job for k, company_jobs in grouped.items() if same_company(key, k) for job in company_jobs]
 
 
-def link_applications(conn: Connection) -> LinkResult:
-    """Mark jobs covered by recorded applications. Idempotent; cheap enough to run often."""
+LINK_STATE_KEY = "application_links"
+FULL_LINK_SECONDS = 24 * 3600  # periodic full pass (catches retitled jobs and stragglers)
+LINK_OVERLAP_IDS = 2000        # re-check recent ids: inserts can commit out of id order
+
+
+def _apps_signature(apps) -> str:
+    return hashlib.sha256(json.dumps([[a.id, a.company_key, a.role, a.kind] for a in apps]).encode()).hexdigest()
+
+
+def link_applications(conn: Connection, *, full: bool = False) -> LinkResult:
+    """Mark jobs covered by recorded applications. Idempotent.
+
+    Incremental: while the applications are unchanged, only jobs inserted since
+    the previous pass can newly match (a newer listing is always the best
+    match), so only those are read. A full pass (every application against all
+    of its employers' jobs) runs when the applications change, every
+    FULL_LINK_SECONDS, or when full=True. The full pass reads hundreds of MB on
+    the VM; running it every two minutes saturated the disk.
+    """
     result = LinkResult()
     # Lock in a stable order; current status predicates below decide transitions,
     # never the stale job snapshot used to find title matches.
     apps = conn.execute(select(applications).where(applications.c.role.is_not(None))
                         .order_by(applications.c.id).with_for_update()).all()
+    signature = _apps_signature(apps)
+    raw_state = conn.execute(select(app_state.c.value).where(app_state.c.key == LINK_STATE_KEY)).scalar_one_or_none()
+    try:
+        state = json.loads(raw_state) if raw_state else {}
+    except ValueError:
+        state = {}
+    now = time.time()
+    top = conn.execute(select(func.max(jobs.c.id))).scalar_one() or 0
+    incremental = (not full and state.get("signature") == signature and isinstance(state.get("cursor"), int)
+                   and now - float(state.get("full_at", 0)) < FULL_LINK_SECONDS)
+    if incremental:
+        since = max(0, state["cursor"] - LINK_OVERLAP_IDS)
+        app_keys = {a.company_key for a in apps if a.company_key}
+        grouped = {k: v for k, v in _jobs_by_company(conn, jobs.c.id > since, jobs.c.id <= top).items()
+                   if any(same_company(k, a) for a in app_keys)} if apps else {}
+        _link(conn, apps, grouped, result, partial=True)
+        _save_link_state(conn, signature=signature, cursor=top, full_at=float(state["full_at"]))
+        return result
     # Compare distinct employers once, then fetch only their job titles. Running
     # the prefix comparison for every job/application pair is costly on a small
     # VM. Materialization prevents PostgreSQL from inlining it back into that loop.
@@ -121,13 +159,28 @@ def link_applications(conn: Connection) -> LinkResult:
         func.starts_with(app_keys.c.company_key, job_keys.c.company_key + " "))).exists()
     relevant_keys = (select(job_keys.c.company_key).where(job_keys.c.company_key.is_not(None), relevant_company)
                      .cte("relevant_company_keys").prefix_with("MATERIALIZED"))
-    grouped = _jobs_by_company(conn, jobs.c.company_key.in_(select(relevant_keys.c.company_key))) if apps else {}
+    grouped = _jobs_by_company(conn, jobs.c.company_key.in_(select(relevant_keys.c.company_key)),
+                               jobs.c.id <= top) if apps else {}
+    _link(conn, apps, grouped, result)
+    _save_link_state(conn, signature=signature, cursor=top, full_at=now)
+    return result
+
+
+def _save_link_state(conn: Connection, **state) -> None:
+    value = json.dumps(state)
+    conn.execute(insert(app_state).values(key=LINK_STATE_KEY, value=value)
+                 .on_conflict_do_update(index_elements=[app_state.c.key], set_={"value": value}))
+
+
+def _link(conn: Connection, apps, grouped: dict[str, list], result: LinkResult, *,
+          partial: bool = False) -> None:
     for app in apps:
         matches = [job for job in _same_company_jobs(grouped, app.company_key) if same_role(app.role, job.title)]
         if not matches:
             continue
         best = max(matches, key=lambda job: job.id)  # newest listing
-        if app.job_id != best.id:
+        # A partial (incremental) view can only add newer listings, never demote the link.
+        if app.job_id != best.id and not (partial and app.job_id is not None and app.job_id > best.id):
             conn.execute(update(applications).where(applications.c.id == app.id).values(job_id=best.id))
             result.applications_linked += 1
         new_status = "REJECTED" if app.kind == "REJECTED" else "APPLIED"
@@ -139,7 +192,6 @@ def link_applications(conn: Connection) -> LinkResult:
                 update(jobs).where(jobs.c.id == job.id, jobs.c.status.in_(allowed)).values(
                     status=new_status,
                     applied_at=func.coalesce(jobs.c.applied_at, app.occurred_at, func.now()))).rowcount
-    return result
 
 
 def mark_applied_by_hand(conn: Connection, job_id: int) -> str | None:

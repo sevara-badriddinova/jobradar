@@ -1,5 +1,8 @@
+import hashlib
+import json
 import logging
 from abc import ABC, abstractmethod
+from pathlib import Path
 from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar
 
@@ -36,6 +39,30 @@ class CollectorError(Exception):
     """A collector could not produce a trustworthy snapshot."""
 
 
+class UnchangedSnapshot(Exception):  # noqa: N818 - control flow, not an error
+    """The source records equal the last ingested snapshot: nothing to normalize
+    or ingest. Raised by normalize_all() when known_digest matches."""
+
+    def __init__(self, digest: str, records: int) -> None:
+        super().__init__(digest)
+        self.digest, self.records = digest, records
+
+
+def _normalizer_fingerprint() -> str:
+    """Digest of the code that turns source records into stored rows, so a
+    release that changes normalization never reuses an old snapshot digest."""
+    root = Path(__file__).resolve().parent.parent
+    files = sorted((root / "collectors").glob("*.py")) + [root / n for n in
+                   ("models.py", "text.py", "job_age.py", "repository.py") if (root / n).exists()]
+    h = hashlib.sha256()
+    for f in files:
+        h.update(f.name.encode() + b"\0" + f.read_bytes())
+    return h.hexdigest()
+
+
+NORMALIZER_FINGERPRINT = _normalizer_fingerprint()
+
+
 class JobCollector(ABC):
     """One source x one company board.
 
@@ -58,6 +85,10 @@ class JobCollector(ABC):
     # storing a never-seen posting as too old for the ingestion window.
     publication_date_trusted: ClassVar[bool] = True
 
+    # Record keys that change on every poll without the posting changing
+    # (excluded from the snapshot digest; the repository ignores them too).
+    volatile_keys: ClassVar[tuple[str, ...]] = ()
+
     def known_older_than(self, job: Job, cutoff: datetime) -> bool:
         """True only when this posting is certainly published before `cutoff`.
 
@@ -77,6 +108,12 @@ class JobCollector(ABC):
         # Optional {source_job_id: stored raw subset} for postings already in the
         # database, so collectors can skip re-fetching details that cannot change.
         self.known: dict[str, dict] = {}
+        # Snapshot digest support: set known_digest to the digest of the last
+        # ingested snapshot to skip normalizing an identical one; digest_salt
+        # carries ingestion parameters that change what would be stored.
+        self.known_digest: str | None = None
+        self.digest_salt: str = ""
+        self.snapshot_digest: str | None = None
 
     @abstractmethod
     def collect(self) -> list[Job]:
@@ -104,7 +141,26 @@ class JobCollector(ABC):
             if client is not self._client:
                 client.close()
 
+    def records_digest(self, records: list[Any]) -> str | None:
+        """Order-independent digest of the source records (volatile keys removed)."""
+        if not records:
+            return None
+        volatile = set(self.volatile_keys)
+        entries = sorted(json.dumps({k: v for k, v in r.items() if k not in volatile} if isinstance(r, dict) else r,
+                                    sort_keys=True, ensure_ascii=True, default=str) for r in records)
+        h = hashlib.sha256(json.dumps([NORMALIZER_FINGERPRINT, type(self).__name__, self.source, self.board,
+                                       self.company, self.complete_snapshot, self.digest_salt]).encode())
+        for entry in entries:
+            h.update(b"\n")
+            h.update(entry.encode())
+        return h.hexdigest()
+
     def normalize_all(self, records: list[Any]) -> list[Job]:
+        # Digest first: an identical listing needs no HTML-to-text parsing at all
+        # (normalization was the largest CPU cost of unchanged polls).
+        self.snapshot_digest = self.records_digest(records)
+        if self.snapshot_digest is not None and self.snapshot_digest == self.known_digest:
+            raise UnchangedSnapshot(self.snapshot_digest, len(records))
         jobs: list[Job] = []
         for raw in records:
             # Record-level failure isolation: one malformed posting is logged

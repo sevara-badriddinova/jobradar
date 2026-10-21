@@ -12,7 +12,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import and_, case, func, or_, select, true, update
+from sqlalchemy import and_, case, func, or_, select, text, true, update
 from sqlalchemy.engine import Connection
 from sqlalchemy.dialects.postgresql import insert
 
@@ -269,6 +269,13 @@ def run_filters(conn: Connection, settings: FilterSettings, *, recheck: bool = F
         active = and_(active, jobs.c.id.in_(list(only_ids)))
         recheck = True
     now = datetime.now(UTC)
+    if not recheck:
+        # Incremental passes touch only the few rows in the small partial
+        # indexes (0009/0012), but PostgreSQL cannot estimate the OR-heavy
+        # predicates and chose a sequential scan of the whole jobs heap
+        # (~700 MB, minutes of disk on the VM) every sweep. Forbid that here;
+        # a full recheck (policy change) still scans normally.
+        conn.execute(text("SET LOCAL enable_seqscan = off"))
     if settings.max_posting_age_days is not None:
         # Expiration changes with time, content eligibility does not. Reject
         # expired/missing dates server-side without transferring any job bodies.
@@ -332,6 +339,8 @@ def run_filters(conn: Connection, settings: FilterSettings, *, recheck: bool = F
             result.passed_ids = list(ids)
         else:
             result.rejected[reason] += len(ids)
+    if not recheck:
+        conn.execute(text("SET LOCAL enable_seqscan = DEFAULT"))
     log.info("filters: %d passed, %d rejected", result.passed, result.rejected.total())
     conn.execute(insert(app_state).values(key="filter_context", value=signature)
         .on_conflict_do_update(index_elements=[app_state.c.key], set_={"value": signature}))

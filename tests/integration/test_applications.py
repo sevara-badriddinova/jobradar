@@ -223,3 +223,43 @@ class TestCli:
         cli.main(["match"])
         assert "Software Engineer, New Grad (Dec 2026)" not in " ".join(c["prompt"] for c in fake.calls)
         assert row(engine, "ng").status == "APPLIED"
+
+
+class TestIncrementalLinking:
+    """Between full passes only newly inserted jobs are read (a newer listing is
+    always the best match); application changes force a full pass."""
+
+    def test_new_listing_is_linked_incrementally(self, engine):
+        seed(engine)
+        add(engine)
+        link(engine)                               # full pass
+        ingest(engine, [make_job("ng2", company="Notion", title="Software Engineer, New Grad", location="SF")],
+               board="notion")
+        result = link(engine)                      # incremental
+        assert result.jobs_marked == 1 and row(engine, "ng2").status == "APPLIED"
+        with engine.connect() as conn:
+            assert conn.execute(select(applications.c.job_id)).scalar_one() == row(engine, "ng2").id
+
+    def test_retitled_old_job_waits_for_a_full_pass_and_links_are_never_demoted(self, engine, monkeypatch):
+        from jobradar import applications as apps_module
+        monkeypatch.setattr(apps_module, "LINK_OVERLAP_IDS", 0)
+        seed(engine)
+        add(engine)
+        link(engine)
+        linked = row(engine, "ng").id
+        with engine.begin() as conn:   # an existing job retitled in place (same id)
+            conn.execute(update(jobs_t).where(jobs_t.c.source_job_id == "ec")
+                         .values(title="Software Engineer, New Grad"))
+        assert link(engine).jobs_marked == 0       # incremental: old ids are not re-read
+        with engine.begin() as conn:
+            result = link_applications(conn, full=True)
+        assert result.jobs_marked == 1 and row(engine, "ec").status == "APPLIED"
+        with engine.connect() as conn:  # still the newest listing
+            assert conn.execute(select(applications.c.job_id)).scalar_one() == max(linked, row(engine, "ec").id)
+
+    def test_changed_applications_force_a_full_pass(self, engine):
+        seed(engine)
+        add(engine)
+        link(engine)
+        add(engine, external_id="m2", company="Ramp", role="Software Engineer, New Grad")
+        assert link(engine).jobs_marked == 1 and row(engine, "ramp").status == "APPLIED"

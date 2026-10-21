@@ -93,6 +93,14 @@ jobs = Table(
     Index("ix_jobs_expiry_candidates", "posted_at", postgresql_where=text(
         "closed_at IS NULL AND (filtered_at IS NULL OR status <> 'FILTERED' OR filter_reason IS NULL "
         "OR filter_reason NOT LIKE 'posting date:%' OR filter_reason = 'posting date: in the future')")),
+    # Same, restricted to filterable statuses (excludes never-filtered duplicates): see 0012.
+    Index("ix_jobs_pending_active", "id", postgresql_where=text(
+        "closed_at IS NULL AND status IN ('DISCOVERED', 'REPOSTED', 'FILTERED', 'MATCHED', 'NOTIFIED') "
+        "AND (filtered_at IS NULL OR filter_reason = 'posting date: in the future')")),
+    Index("ix_jobs_expiry_active", "posted_at", postgresql_where=text(
+        "closed_at IS NULL AND status IN ('DISCOVERED', 'REPOSTED', 'FILTERED', 'MATCHED', 'NOTIFIED') "
+        "AND (filtered_at IS NULL OR status <> 'FILTERED' OR filter_reason IS NULL "
+        "OR filter_reason NOT LIKE 'posting date:%' OR filter_reason = 'posting date: in the future')")),
 )
 
 companies = Table(
@@ -258,6 +266,9 @@ board_state = Table(
     Column("last_error", Text),
     Column("last_bytes", BigInteger),
     Column("last_fetched", Integer),
+    # Digest of the last fully ingested snapshot (unchanged polls skip ingestion).
+    Column("snapshot_hash", Text),
+    Column("snapshot_at", TS),
     Index("ix_board_state_due", "next_due_at"),
 )
 

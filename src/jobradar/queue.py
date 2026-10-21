@@ -205,6 +205,7 @@ class Board:
     priority: int
     last_bytes: int | None
     consecutive_failures: int
+    snapshot_hash: str | None = None   # only while recent enough to trust (see claim_boards)
 
 
 def seed_boards(conn: Connection) -> int:
@@ -220,6 +221,11 @@ def seed_boards(conn: Connection) -> int:
         WHERE NOT EXISTS (SELECT 1 FROM board_state b WHERE b.company_id = c.id)
         ON CONFLICT (company_id) DO NOTHING
     """)).rowcount
+
+
+# A stored snapshot digest lets an identical poll skip ingestion entirely. Every
+# board is still fully re-ingested at least this often (self-healing).
+SNAPSHOT_TRUST_SECONDS = 24 * 3600
 
 
 def claim_boards(conn: Connection, collector: str, owner: str, limit: int,
@@ -241,9 +247,10 @@ def claim_boards(conn: Connection, collector: str, owner: str, limit: int,
         FROM picked, companies c
         WHERE b.company_id = picked.company_id AND c.id = b.company_id
         RETURNING b.company_id, c.name, c.collector, c.board, c.priority, b.last_bytes,
-                  b.consecutive_failures
+                  b.consecutive_failures,
+                  CASE WHEN b.snapshot_at > now() - make_interval(secs => :trust) THEN b.snapshot_hash END
     """), {"collector": collector, "owner": owner, "limit": int(limit),
-           "lease": float(lease_seconds)}).all()
+           "lease": float(lease_seconds), "trust": float(SNAPSHOT_TRUST_SECONDS)}).all()
     return [Board(*r) for r in rows]
 
 
@@ -289,10 +296,12 @@ def next_poll_delay(*, ok: bool, priority: int, failures: int, error: str | None
 
 def finish_board(conn: Connection, board: Board, owner: str, *, ok: bool, error: str | None,
                  fetched: int | None, nbytes: int | None, base_interval: float = 1800.0,
-                 retry_in: float | None = None) -> bool:
+                 retry_in: float | None = None, snapshot_hash: str | None = None) -> bool:
     """Record a poll outcome and schedule the next one.
 
     `retry_in` reschedules without counting a failure (backpressure/shutdown).
+    `snapshot_hash` records the digest of a snapshot that was just fully
+    ingested (and committed); unchanged polls pass None and keep the old one.
     Returns False if the lease was lost to another worker.
     """
     if retry_in is not None:
@@ -310,10 +319,13 @@ def finish_board(conn: Connection, board: Board, owner: str, *, ok: bool, error:
             consecutive_failures = :failures,
             last_success_at = CASE WHEN :ok THEN now() ELSE last_success_at END,
             last_error = CASE WHEN :ok THEN NULL ELSE left(:error, 1000) END,
-            last_bytes = coalesce(:nbytes, last_bytes), last_fetched = coalesce(:fetched, last_fetched)
+            last_bytes = coalesce(:nbytes, last_bytes), last_fetched = coalesce(:fetched, last_fetched),
+            snapshot_hash = coalesce(CAST(:snap AS text), snapshot_hash),
+            snapshot_at = CASE WHEN CAST(:snap AS text) IS NOT NULL THEN now() ELSE snapshot_at END
         WHERE company_id = :id AND lease_owner = :owner
     """), {"id": board.company_id, "owner": owner, "delay": delay, "failures": failures, "ok": ok,
-           "error": error or "", "nbytes": nbytes, "fetched": fetched}).rowcount)
+           "error": error or "", "nbytes": nbytes, "fetched": fetched,
+           "snap": snapshot_hash if ok else None}).rowcount)
 
 
 def extend_board(conn: Connection, board: Board, owner: str, lease_seconds: float = 900) -> bool:

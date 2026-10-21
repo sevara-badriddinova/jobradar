@@ -39,6 +39,7 @@ class WorkdayCollector(JobCollector):
     source = "workday"
     page_size = 20  # CXS rejects larger limits on some tenants
     reuses_known_details = "jobPostingInfo"
+    volatile_keys = ("postedOn",)   # "Posted N Days Ago" ticks daily
     max_pages = 1000
 
     def collect(self) -> list[Job]:

@@ -5,6 +5,7 @@ process crashes half-way, the transaction rolls back and the next poll simply
 redoes the work: re-running is always safe (idempotent).
 """
 
+import hashlib
 import json
 import logging
 from collections.abc import Callable
@@ -87,6 +88,31 @@ def _stable(raw, source: str):
     return raw
 
 
+SNAPSHOT_DIGEST_VERSION = 1
+
+
+def snapshot_digest(source: str, jobs: list[Job], *, complete: bool, max_age_days: int | None) -> str | None:
+    """Order-independent digest of everything ingestion would store for a board.
+
+    Two polls with the same digest would make ingestion write nothing (same IDs,
+    same stored fields, volatile raw keys excluded, same window), so an identical
+    poll can skip ingestion. None for empty snapshots, which are never trusted.
+    """
+    if not jobs:
+        return None
+    volatile = VOLATILE_RAW_KEYS.get(source, ())
+    entries = sorted(json.dumps([
+        job.source_job_id, job.company, job.title, job.location, job.url, job.description,
+        job.posted_at.isoformat() if job.posted_at else None,
+        {k: v for k, v in job.raw.items() if k not in volatile},
+    ], sort_keys=True, ensure_ascii=True, default=str) for job in jobs)
+    h = hashlib.sha256(json.dumps([SNAPSHOT_DIGEST_VERSION, source, complete, max_age_days]).encode())
+    for entry in entries:
+        h.update(b"\n")
+        h.update(entry.encode())
+    return h.hexdigest()
+
+
 def ingest_snapshot(
     conn: Connection, *, source: str, board: str, jobs: list[Job], complete: bool = True,
     skip_new: Callable[[Job], bool] | None = None,
@@ -139,12 +165,15 @@ def ingest_snapshot(
         ).join(incoming, jobs_t.c.source_job_id == incoming.c.sid).where(jobs_t.c.source == source))
         existing.update((r.source_job_id, r) for r in rows)
     result.seen = len(existing)
-    result.reopened = sum(1 for r in existing.values() if r.closed_at is not None)
-    conn.execute(
-        update(jobs_t)
-        .where(jobs_t.c.id.in_([r.id for r in existing.values()]))
-        .values(last_seen_at=func.now(), closed_at=None)
-    )
+    # Only reopened rows need a write. Rewriting every listed row on every poll
+    # (to refresh last_seen_at) created a new tuple, WAL, and index entries for
+    # each one: the dominant disk cost on the VM. An open job's last sighting is
+    # its board's last successful poll (board_state.last_success_at).
+    reopened = [r.id for r in existing.values() if r.closed_at is not None]
+    result.reopened = len(reopened)
+    if reopened:
+        conn.execute(update(jobs_t).where(jobs_t.c.id.in_(reopened))
+                     .values(last_seen_at=func.now(), closed_at=None))
     # Change detection: compare cheap hashes/fields, rewrite only what changed.
     for sid, row in existing.items():
         job = snapshot[sid]

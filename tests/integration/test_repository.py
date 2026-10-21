@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 
 import pytest
+from sqlalchemy import text
 
 from jobradar import dedup
 from jobradar.db import jobs as jobs_t
@@ -52,13 +53,19 @@ class TestStoredFields:
         assert r.closed_at is None and r.content_changed_at is None
         assert r.first_seen_at == r.last_seen_at
 
-    def test_first_seen_is_preserved_last_seen_advances(self, engine):
+    def test_unchanged_repoll_writes_nothing(self, engine):
+        # Re-listing a known open job must not rewrite its row (each rewrite is a
+        # new tuple + WAL + index entries); the board's last success records it.
         ingest(engine, [make_job("1")])
         before = row(engine, "1")
+        with engine.connect() as conn:
+            xmin = conn.execute(text("SELECT xmin::text FROM jobs WHERE source_job_id = '1'")).scalar_one()
         ingest(engine, [make_job("1")])
         after = row(engine, "1")
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT xmin::text FROM jobs WHERE source_job_id = '1'")).scalar_one() == xmin
         assert after.first_seen_at == before.first_seen_at
-        assert after.last_seen_at > before.last_seen_at
+        assert after.last_seen_at == before.last_seen_at
 
 
 class TestChangeDetection:

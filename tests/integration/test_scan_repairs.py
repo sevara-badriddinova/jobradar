@@ -74,5 +74,38 @@ def test_empty_incremental_filter_uses_small_indexes(engine):
     finally:
         event.remove(engine, "before_cursor_execute", capture)
     assert len(plans) == 4
-    assert "ix_jobs_pending_filter" in plans[-1]
-    assert all("ix_jobs_expiry_candidates" in plan for plan in plans[:3])
+    assert all("Seq Scan" not in plan for plan in plans)
+    assert "ix_jobs_pending_active" in plans[-1]
+    assert all("ix_jobs_expiry_active" in plan for plan in plans[:3])
+
+
+def test_never_filtered_duplicates_do_not_force_sequential_sweeps(engine):
+    """Undated duplicates keep filtered_at NULL forever; they must not make the
+    sweep estimate a large candidate set and scan the whole jobs heap."""
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO jobs (source,board,source_job_id,company,company_key,title,url,canonical_url,
+                description,description_hash,fingerprint,raw,status,posted_at,duplicate_of_id,dedup_reason)
+            SELECT 'workday','dupes',n::text,'Acme','acme','Engineer','u','u','d','h','f','{}',
+                'DUPLICATE',NULL,NULL,NULL FROM generate_series(1,30000) n
+        """))
+        conn.execute(text("UPDATE jobs SET duplicate_of_id = id, dedup_reason = 'fingerprint'"))
+        conn.execute(text("ANALYZE jobs"))
+        run_filters(conn, FilterSettings(max_posting_age_days=3))
+    plans = []
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("SELECT jobs.id, jobs.title") or statement.startswith("UPDATE jobs SET"):
+            with conn.connection.cursor() as explain:
+                explain.execute("EXPLAIN (FORMAT JSON) " + statement, parameters)
+                plans.append(str(explain.fetchone()[0]))
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        with engine.begin() as conn:
+            # Reproduce production's choice: there the OR-heavy estimate made a
+            # heap scan look cheaper than the tiny partial index.
+            conn.execute(text("SET LOCAL random_page_cost = 1000"))
+            conn.execute(text("SET LOCAL seq_page_cost = 0.01"))
+            run_filters(conn, FilterSettings(max_posting_age_days=3))
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+    assert plans and all("Seq Scan" not in plan for plan in plans)
