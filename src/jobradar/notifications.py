@@ -299,7 +299,11 @@ def _process_updates(engine: Engine, tg: Telegram, chat_id: str, timeout: int) -
                     notifications.c.status == "sent")).first() is not None
                 finished = changed and was_sent and remaining(conn) == 0
             if show_queue or (finished and not navigation):
-                request_queue(conn, chat_id, view=command_view or "new", page=0, explicit=show_queue)
+                # A typed/menu command or "Show queue" gets its answer at the
+                # bottom of the chat; inline navigation keeps editing in place.
+                pressed_on = (query.get("message") or {}).get("message_id") if query else None
+                request_queue(conn, chat_id, view=command_view or "new", page=0, explicit=show_queue,
+                              relocate=show_queue, from_message_id=pressed_on)
             elif outcome is not None and not navigation:
                 request_queue(conn, chat_id, create=False)
             offset = upd["update_id"] + 1

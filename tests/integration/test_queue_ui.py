@@ -174,24 +174,81 @@ def test_unknown_create_delivery_does_not_duplicate_or_mark_jobs_sent(engine, se
         assert conn.execute(select(notifications.c.status)).scalar_one() == "pending"
 
 
-def test_main_menu_commands_and_back_navigation_edit_same_message(engine, server, tg):
+def test_every_menu_command_answers_at_the_bottom_and_navigation_edits_in_place(engine, server, tg):
+    """Production: commands edited the long-lived queue message (#18, far up the
+    chat) or, when nothing changed, made no Telegram call at all, so every menu
+    command looked ignored. Each command must now produce a visible answer."""
     matched(engine, {"a": 90})
     click(engine, server, tg, "show_queue")
-    for command, view in (("/menu", "menu"), ("/new", "new"), ("/liked", "liked"),
-                          ("/applied", "applied"), ("/skipped@jobradar_test_bot", "skipped")):
+    first = server.sent[-1]["message_id"]
+    previous = first
+    for command, view, marker in (("/menu", "menu", "JobRadar"), ("/new", "new", "Engineer a"),
+                                  ("/liked", "liked", None), ("/applied", "applied", None),
+                                  ("/skipped@jobradar_test_bot", "skipped", None), ("/start", "menu", "JobRadar"),
+                                  ("/queue", "new", "Engineer a"), ("/new", "new", "Engineer a")):
+        sent_before = len(server.sent)
         server.message_from(int(CHAT), "User", command)
         process_updates(engine, tg, CHAT)
+        assert len(server.sent) == sent_before + 1, command      # a new answer, even if unchanged
+        answer = server.sent[-1]
+        if marker:
+            assert marker in answer["text"], command
+        retired = [e for e in server.edited if e["message_id"] == previous]
+        assert retired and retired[-1]["reply_markup"] == {"inline_keyboard": []}
+        assert "Moved" in retired[-1]["text"]
         with engine.connect() as conn:
-            assert read_state(conn, CHAT)["view"] == view
-    click(engine, server, tg, "q:menu")
-    assert "JobRadar" in server.edited[-1]["text"]
+            state = read_state(conn, CHAT)
+        assert state["view"] == view and state["message_id"] == answer["message_id"]
+        assert "retired_message_id" not in state
+        previous = answer["message_id"]
+    # Inline navigation keeps editing the current message in place.
+    sent_before = len(server.sent)
+    click(engine, server, tg, "q:menu", message_id=previous)
+    assert "JobRadar" in server.edited[-1]["text"] and server.edited[-1]["message_id"] == previous
     assert len(server.edited[-1]["reply_markup"]["inline_keyboard"]) == 2
-    click(engine, server, tg, f"q:open:{row(engine, 'a').id}:new:0")
+    click(engine, server, tg, f"q:open:{row(engine, 'a').id}:new:0", message_id=previous)
     buttons = [b for r in server.edited[-1]["reply_markup"]["inline_keyboard"] for b in r]
     assert any(b["text"] == "🏠 Main menu" for b in buttons)
     assert not any("q:list:liked" in b.get("callback_data", "") for b in buttons)
     assert "🕒" in server.edited[-1]["text"]
-    assert len(server.sent) == 1
+    assert len(server.sent) == sent_before
+
+
+def test_command_answer_survives_a_failed_retire_and_a_failed_send(engine, server, tg):
+    matched(engine, {"a": 90})
+    server.message_from(int(CHAT), "User", "/new")
+    process_updates(engine, tg, CHAT)
+    first = server.sent[-1]["message_id"]
+    # The old message can no longer be edited: the answer still arrives.
+    server.fail("editMessageText", (400, {"ok": False, "error_code": 400,
+                                          "description": "Bad Request: message can't be edited"}))
+    server.message_from(int(CHAT), "User", "/liked")
+    process_updates(engine, tg, CHAT)
+    assert server.sent[-1]["message_id"] != first
+    with engine.connect() as conn:
+        assert read_state(conn, CHAT)["message_id"] == server.sent[-1]["message_id"]
+    # A send that definitely failed is retried on the next command, never lost.
+    server.fail("sendMessage", (500, {"ok": False, "error_code": 500, "description": "Internal"}))
+    sent_before = len(server.sent)
+    server.message_from(int(CHAT), "User", "/applied")
+    process_updates(engine, tg, CHAT)
+    server.message_from(int(CHAT), "User", "/applied")
+    process_updates(engine, tg, CHAT)
+    assert len(server.sent) == sent_before + 1
+    with engine.connect() as conn:
+        assert read_state(conn, CHAT)["view"] == "applied"
+
+
+def test_alert_buttons_still_record_choices_without_moving_the_queue(engine, server, tg):
+    matched(engine, {"a": 90})
+    click(engine, server, tg, "show_queue")
+    sent_before = len(server.sent)
+    job_id = row(engine, "a").id
+    click(engine, server, tg, f"applied:{job_id}", message_id=555)
+    with engine.connect() as conn:
+        assert conn.execute(select(job_reviews.c.choice).where(job_reviews.c.job_id == job_id)).scalar_one() \
+            == "APPLIED"
+    assert len(server.sent) == sent_before                       # no extra queue message
 
 
 def test_job_list_has_no_visible_ids_or_numbering_and_has_age(engine, server, tg):
@@ -233,3 +290,15 @@ def test_mini_app_uses_the_same_freshness_rule_as_alerts(engine):
     assert "Backend Engineer" in body and "Platform Engineer" not in body
     assert "newly listed and posted within 14 days" in body
     assert "Backend Engineer" not in strict_body
+
+
+def test_show_queue_on_a_new_alert_moves_the_queue_down(engine, server, tg):
+    matched(engine, {"a": 90})
+    click(engine, server, tg, "show_queue")
+    queue_message = server.sent[-1]["message_id"]
+    click(engine, server, tg, "show_queue", message_id=queue_message)       # on itself: in place
+    assert server.sent[-1]["message_id"] == queue_message
+    click(engine, server, tg, "show_queue", message_id=777)                 # on a later alert: moves down
+    assert server.sent[-1]["message_id"] != queue_message
+    assert any(e["message_id"] == queue_message and e["reply_markup"] == {"inline_keyboard": []}
+               for e in server.edited)

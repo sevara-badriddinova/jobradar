@@ -92,12 +92,14 @@ def test_queue_commands_are_private_and_repeat_updates_are_idempotent(engine, se
         server.message_from(int(CHAT), "User", command)
         process_updates(engine, tg, CHAT)
         assert "Your jobs" in server.sent[-1]["text"]
-    assert len(server.sent) == 1
-    server.press("q:list:liked:0", chat_id=CHAT)
+    assert len(server.sent) == 3              # every typed command gets a visible answer
+    process_updates(engine, tg, CHAT)         # a repeated poll replays nothing
+    assert len(server.sent) == 3
+    server.press("q:list:liked:0", chat_id=CHAT, message_id=server.sent[-1]["message_id"])
     process_updates(engine, tg, CHAT)
     assert "Engineer a" in server.edited[-1]["text"]
     process_updates(engine, tg, CHAT)
-    assert len(server.sent) == 1
+    assert len(server.sent) == 3
 
 
 def test_persisted_summary_sends_after_restart_and_unknown_delivery_is_not_retried(engine, server, tg):

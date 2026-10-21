@@ -41,7 +41,11 @@ def write_state(conn, chat_id, state):
 
 def request_queue(conn, chat_id, *, view=None, page=None, job_id=None,
                   explicit=False, create=True, min_score=None, publish=None, max_posting_age_days=_UNCHANGED,
-                  discovery_days=_UNCHANGED):
+                  discovery_days=_UNCHANGED, relocate=False, from_message_id=None):
+    """relocate: answer a typed/menu command with a fresh message at the bottom of
+    the chat instead of editing the long-lived queue message in place (which may
+    be far up the history, and is not touched at all when nothing changed, so the
+    command looked ignored). The previous message is retired by sync_queue."""
     state = read_state(conn, chat_id, lock=True)
     if state is None:
         if not create:
@@ -63,6 +67,11 @@ def request_queue(conn, chat_id, *, view=None, page=None, job_id=None,
         state["min_score"] = min_score
     if publish is not None:
         state["publish"] = publish
+    if from_message_id is not None and from_message_id == state.get("message_id"):
+        relocate = False      # pressed on the queue message itself: update it in place
+    if relocate and state.get("message_id") and not state.get("sending"):
+        state["retired_message_id"] = state["message_id"]
+        state.update(message_id=None, fingerprint=None)
     if explicit and not state.get("message_id"):
         state["sending"] = False  # explicit recovery from unknown first delivery
     state.update(dirty=True, revision=state["revision"] + 1)
@@ -263,10 +272,13 @@ def sync_queue(engine, tg, chat_id):
                 write_state(conn, chat_id, current)
             log.warning("queue update failed; saved choices are preserved: %s", exc)
             return
+    retired = state.get("retired_message_id")
     with engine.begin() as conn:
         current = read_state(conn, chat_id, lock=True)
         current.update(message_id=message_id, sending=False, fingerprint=fingerprint,
                        dirty=current["revision"] != state["revision"])
+        if retired and current.get("retired_message_id") == retired:
+            current.pop("retired_message_id")
         write_state(conn, chat_id, current)
         if pending:
             conn.execute(update(notifications).where(notifications.c.id.in_([r.id for r in pending]),
@@ -274,3 +286,8 @@ def sync_queue(engine, tg, chat_id):
                 sent_at=func.now(), last_error=None))
             conn.execute(update(jobs).where(jobs.c.id.in_([r.job_id for r in pending]), jobs.c.status == "MATCHED")
                          .values(status="NOTIFIED", notified_at=func.now()))
+    if retired and retired != message_id:
+        try:  # cosmetic: old buttons would only lead back here
+            tg.edit_message(chat_id, retired, "⬇️ Moved to the latest message below.", [])
+        except TelegramError as exc:
+            log.info("could not retire the previous queue message: %s", exc)
