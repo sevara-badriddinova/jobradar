@@ -104,3 +104,61 @@ def location_strings(value: Any) -> list[str]:
                 "label", "descriptor", "address", "addressCountry", "addressLocality", "addressRegion")
         return [s for k in keys for s in location_strings(value.get(k))]
     return []
+
+
+def overlapping_pages(collector: JobCollector, fetch: Callable[[int], tuple[list, int]], key: Callable[[dict], Any],
+                      *, page_size: int, overlap: int, max_items: int) -> list[dict]:
+    """Offset pagination over a live, date-sorted search.
+
+    Offsets are not a stable snapshot: a posting removed between two requests
+    shifts everything after it left, so one posting would be skipped and then
+    wrongly closed. Consecutive pages overlap by `overlap` entries and are
+    de-duplicated by `key`, which absorbs up to that many removals per page.
+    New postings at the top only shift entries right (seen twice, kept once).
+
+    The snapshot stays complete only when every page was read and the unique
+    count reached the total the source reported on its last page; otherwise
+    `collector.complete_snapshot` is cleared so nothing is closed.
+    """
+    step = page_size - overlap
+    if step <= 0:
+        raise ValueError("overlap must be smaller than the page size")
+    records: list[dict] = []
+    seen: set = set()
+    offset, total = 0, None
+    while True:
+        try:
+            page, reported = fetch(offset)
+            if not isinstance(page, list) or type(reported) is not int or reported < 0:
+                raise CollectorError("invalid search page or total")
+        except CollectorError:
+            if not records:
+                raise
+            log.warning("%s/%s: page at offset %d unavailable; incomplete snapshot",
+                        collector.source, collector.board, offset)
+            collector.complete_snapshot = False
+            break
+        total = reported
+        if total > max_items:
+            # The source refuses deep offsets: a truncated listing would close
+            # every posting beyond the cap.
+            collector.complete_snapshot = False
+            log.warning("%s/%s: %d postings exceed the %d the source can page through",
+                        collector.source, collector.board, total, max_items)
+        for item in page:
+            k = key(item) if isinstance(item, dict) else None
+            if k is None:
+                collector.complete_snapshot = False
+                log.warning("%s/%s: skipping entry without an id at offset %d", collector.source, collector.board, offset)
+                continue
+            if k not in seen:
+                seen.add(k)
+                records.append(item)
+        if len(page) < page_size or offset + page_size >= min(total, max_items):
+            break
+        offset += step
+    if total is not None and len(seen) < min(total, max_items):
+        collector.complete_snapshot = False
+        log.warning("%s/%s: %d unique postings of %d reported; incomplete snapshot",
+                    collector.source, collector.board, len(seen), total)
+    return records

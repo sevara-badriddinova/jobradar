@@ -87237,3 +87237,54 @@ collector = "workday"
 board = "wd5:zrsmanagement:7a72735f63617265657273"
 priority = 3
 enabled = true
+
+# Big-company career APIs (verified 2026-10-21). Board tokens are documented in
+# each collector module: src/jobradar/collectors/{amazon,eightfold,oracle_hcm}.py
+
+# Amazon: US software development category (amazon.jobs search feed)
+[[company]]
+name = "Amazon"
+collector = "amazon"
+board = "software-development"
+priority = 1
+enabled = true
+
+# Microsoft: US, profession = software engineering
+[[company]]
+name = "Microsoft"
+collector = "eightfold"
+board = "apply.careers.microsoft.com:microsoft.com:pcsx:6c6f636174696f6e3d556e697465642b5374617465732666696c7465725f70726f66657373696f6e3d736f6674776172652b656e67696e656572696e67"
+priority = 1
+enabled = true
+
+# Netflix: all open roles (pcsx search is blocked for this tenant)
+[[company]]
+name = "Netflix"
+collector = "eightfold"
+board = "explore.jobs.netflix.net:netflix.com:v2:"
+priority = 1
+enabled = true
+
+# Oracle: all US roles, site CX_45001
+[[company]]
+name = "Oracle"
+collector = "oracle"
+board = "eeho.fa.us2:43585f3435303031:300000000149325"
+priority = 1
+enabled = true
+
+# JPMorgan Chase: US, category Software Engineering
+[[company]]
+name = "JPMorgan Chase"
+collector = "oracle"
+board = "jpmc.fa:43585f31303031:300000000289738:300000086152753"
+priority = 1
+enabled = true
+
+# JPMorgan Chase: US, category Infrastructure Engineering
+[[company]]
+name = "JPMorgan Chase"
+collector = "oracle"
+board = "jpmc.fa:43585f31303031:300000000289738:300000086249821"
+priority = 2
+enabled = true

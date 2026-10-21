@@ -27,6 +27,18 @@ def location_raw():
             publicationMetadata=_object(jobLocation=raw["publicationMetadata"]["jobLocation"])),
         "personio": _object(additionalOffices=raw["additionalOffices"],
             publicationMetadata=_object(jobLocation=raw["publicationMetadata"]["jobLocation"])),
+        "amazon": _object(normalized_location=raw["normalized_location"], location=raw["location"],
+                          country_code=raw["country_code"], locations=raw["locations"]),
+        "oracle": _object(PrimaryLocation=raw["PrimaryLocation"], PrimaryLocationCountry=raw["PrimaryLocationCountry"],
+            secondaryLocations=raw["secondaryLocations"],
+            detail=_object(PrimaryLocationCountry=raw["detail"]["PrimaryLocationCountry"],
+                           secondaryLocations=raw["detail"]["secondaryLocations"],
+                           workLocation=raw["detail"]["workLocation"],
+                           otherWorkLocations=raw["detail"]["otherWorkLocations"])),
+        "eightfold": _object(locations=raw["locations"], standardizedLocations=raw["standardizedLocations"],
+            location=raw["location"],
+            detail=_object(locations=raw["detail"]["locations"], location=raw["detail"]["location"],
+                           standardizedLocations=raw["detail"]["standardizedLocations"])),
     }, value=jobs.c.source, else_=_object()).label("raw")
 
 

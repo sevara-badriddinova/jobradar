@@ -14,6 +14,7 @@ from jobradar.filters import run_filters
 from jobradar.matcher import run_matching
 from jobradar.query_fields import location_raw
 from jobradar.settings import FilterSettings, Preferences
+from tests.ats_fixtures import amazon_item, eightfold_detail, eightfold_item, oracle_detail, oracle_item
 from tests.factories import make_job
 from tests.integration.helpers import ingest, row
 from tests.integration.test_matcher import add_profile, llm
@@ -62,13 +63,24 @@ def test_raw_changes_detected_without_downloading_stored_payload(engine, stateme
     ("recruitee", {"locations": ["Remote"], "country_code": "US", "description": "x" * 100_000}),
     ("rippling", {"workLocations": ["US"], "publicationMetadata": {"jobLocation": ["CA"], "description": "x" * 100_000}}),
     ("personio", {"additionalOffices": {"office": ["US"]}, "publicationMetadata": {"jobLocation": ["CA"]}, "jobDescriptions": "x" * 100_000}),
+    ("amazon", {**amazon_item("1"), "description": "x" * 100_000}),
+    ("oracle", {**oracle_item("1"), "detail": {**oracle_detail("1")["items"][0], "ExternalDescriptionStr": "x" * 100_000,
+                "otherWorkLocations": [{"TownOrCity": "Toronto", "Country": "CA"}]}}),
+    ("eightfold", {**eightfold_item(1), "detail": {**eightfold_detail(1)["data"], "location": "Remote, Canada",
+                   "jobDescription": "x" * 100_000}}),
 ])
 def test_compact_metadata_preserves_every_collector_location(engine, source, raw):
+    assert COLLECTORS[source].locations(raw)
     ingest(engine, [make_job("a", source=source).model_copy(update={"raw": raw})], source=source)
     with engine.connect() as conn:
         compact = conn.execute(select(location_raw())).scalar_one()
     assert COLLECTORS[source].locations(compact) == COLLECTORS[source].locations(raw)
     assert len(json.dumps(compact)) < len(json.dumps(raw)) / 100
+
+
+def test_every_collector_has_a_compact_location_case():
+    cases = test_compact_metadata_preserves_every_collector_location.pytestmark[0].args[1]
+    assert {source for source, _ in cases} == set(COLLECTORS)
 
 
 def test_filter_skips_old_titles_and_unchanged_bodies_but_expires_jobs(engine, statements):

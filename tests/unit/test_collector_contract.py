@@ -10,7 +10,10 @@ import pytest
 from jobradar.collectors import COLLECTORS, CollectorError
 from jobradar.models import Job
 from tests.factories import RecordingTransport, ashby_job, greenhouse_job, lever_posting
-from tests.ats_fixtures import WORKDAY_BOARD, public_handler
+from tests.ats_fixtures import EIGHTFOLD_BOARD, ORACLE_BOARD, WORKDAY_BOARD, public_handler
+
+BOARDS = {"workday": WORKDAY_BOARD, "oracle": ORACLE_BOARD, "eightfold": EIGHTFOLD_BOARD,
+          "amazon": "software-development"}
 
 # source -> (successful response with two jobs, host the collector must call)
 CASES = {
@@ -25,15 +28,15 @@ CASES = {
 CASES.update({source: (lambda source=source: public_handler(source), host) for source, host in {
     "workday": "acme.wd1.myworkdayjobs.com", "workable": "apply.workable.com",
     "recruitee": "acme.recruitee.com", "rippling": "api.rippling.com",
-    "personio": "acme.jobs.personio.de",
+    "personio": "acme.jobs.personio.de", "amazon": "www.amazon.jobs",
+    "oracle": "acme.fa.us2.oraclecloud.com", "eightfold": "careers.acme.com",
 }.items()})
 
 collectors = pytest.mark.parametrize("source", sorted(COLLECTORS))
 
 
 def make(source, *responses, board="Acme", company="Acme Inc"):
-    if source == "workday":
-        board = WORKDAY_BOARD
+    board = BOARDS.get(source, board)
     t = RecordingTransport(*responses)
     return COLLECTORS[source](board, company=company, client=t.client()), t
 
@@ -45,7 +48,7 @@ def test_every_collector_has_a_contract_case():
 @collectors
 def test_identity(source):
     c, _ = make(source, CASES[source][0]())
-    assert c.source == source and c.board == (WORKDAY_BOARD if source == "workday" else "acme") and isinstance(c.complete_snapshot, bool)
+    assert c.source == source and c.board == BOARDS.get(source, "acme") and isinstance(c.complete_snapshot, bool)
 
 
 @collectors
