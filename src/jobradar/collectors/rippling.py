@@ -10,13 +10,20 @@ from jobradar.text import html_to_text
 
 class RipplingCollector(JobCollector):
     source = "rippling"
+    # One detail request per posting on every poll, with no stored reuse:
+    # compare the listing first and skip details for rejected titles.
+    title_first = True
+    early_digest = True
 
     def collect(self):
         self.complete_snapshot = True
         base = f"https://api.rippling.com/platform/api/ats/v1/board/{slug(self.board)}/jobs"
         records = require_records(self.fetch_json(base))
+        self.check_listing_digest(records)
 
         def detail(item):
+            if not self.needs_detail(item.get("name")):
+                return item          # listing fields only; the title filter rejects it anyway
             job_id = slug(item["uuid"])
             raw = self.fetch_json(base + "/" + quote(job_id, safe=""))
             if not isinstance(raw, dict) or raw.get("uuid") != job_id:

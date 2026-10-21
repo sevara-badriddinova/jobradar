@@ -36,6 +36,10 @@ REVERIFY = 12  # with 30-60 min revisits, each stored date is re-checked every ~
 class PersonioCollector(JobCollector):
     source = "personio"
     reuses_known_details = "publicationMetadata"
+    # The feed carries title and description; details only date a posting.
+    # Rejected titles need no date. (No early digest: the random re-verify
+    # below is how a republication under the same ID is noticed.)
+    title_first = True
 
     def host(self):
         # Default is .de; .com is a distinct region, never silently substituted.
@@ -64,6 +68,8 @@ class PersonioCollector(JobCollector):
             # job per poll, but re-verify a random 1/REVERIFY share each poll so a
             # republication under the same ID is still picked up within hours.
             stored = self.known.get(self.board + ":" + job_id, {}).get("publicationMetadata") or {}
+            if not self.needs_detail(raw.get("name")):
+                return {**raw, "publicationMetadata": stored} if stored else raw
             if parse_iso_datetime(stored.get("datePosted")) and random.random() >= 1 / REVERIFY:
                 return {**raw, "publicationMetadata": stored}
             url = self.host() + "/job/" + job_id

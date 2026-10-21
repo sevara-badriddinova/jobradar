@@ -51,7 +51,8 @@ def _known_details(engine: Engine, collector: JobCollector) -> dict[str, dict]:
 
 def run_collector(engine: Engine, collector: JobCollector, *, after_ingest=None,
                   record_unchanged: bool = True, ingest_max_age_days: int | None = None,
-                  known_snapshot: str | None = None) -> RunReport:
+                  known_snapshot: str | None = None, wants_detail=None,
+                  detail_policy: str | None = None) -> RunReport:
     """Collect and ingest one board. `after_ingest(conn, report)` runs inside the
     ingest transaction (the workers queue filter tasks there, atomically).
 
@@ -63,6 +64,10 @@ def run_collector(engine: Engine, collector: JobCollector, *, after_ingest=None,
     known_snapshot: digest of this board's last ingested snapshot. A poll with
     the same digest skips ingestion (no reads or writes of jobs); a different
     one is ingested and its digest returned in report.snapshot_hash.
+
+    wants_detail(title) / detail_policy: title-first detail fetching for
+    collectors that support it. The policy fingerprint is part of their digest,
+    so a filter change re-collects them and hydrates newly relevant titles.
     """
     source, board = collector.source, collector.board
     started = time.monotonic()
@@ -83,7 +88,11 @@ def run_collector(engine: Engine, collector: JobCollector, *, after_ingest=None,
         if getattr(collector, "reuses_known_details", None):
             collector.known = _known_details(engine, collector)
         collector.known_digest = known_snapshot   # base collectors: skip normalizing an identical listing
-        collector.digest_salt = json.dumps({"max_age_days": ingest_max_age_days})
+        salt = {"max_age_days": ingest_max_age_days}
+        if wants_detail is not None and getattr(collector, "title_first", False):
+            collector.wants_detail = wants_detail
+            salt["detail_policy"] = detail_policy
+        collector.digest_salt = json.dumps(salt)
         try:
             jobs = collector.collect()
         except UnchangedSnapshot as same:   # `same` is unbound after this block

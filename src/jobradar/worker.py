@@ -23,6 +23,7 @@ application history, and existing filter behaviour are unchanged.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -45,7 +46,7 @@ from jobradar.applications import link_applications
 from jobradar.candidate import refresh_experience
 from jobradar.collectors import build_collector
 from jobradar.db import notifications, work_queue
-from jobradar.filters import run_filters
+from jobradar.filters import run_filters, title_reason
 from jobradar.http import BackpressureError, ByteBudget, RateLimiter, byte_bounded, make_client
 from jobradar.matcher import invalidate_stale_matches, run_matching
 from jobradar.notifications import enqueue as enqueue_notifications
@@ -232,6 +233,14 @@ class Worker:
                     self._boards[b.company_id] = b
         return claimed
 
+    def detail_policy(self):
+        """Title-first details: (wants_detail(title), fingerprint of the title rules)."""
+        f = self.settings.filters
+        rules = json.dumps({"include": f.title_must_include, "exclude": f.title_must_exclude, "v": 1},
+                           sort_keys=True)
+        return (lambda title: title_reason(title, f) is None,
+                hashlib.sha256(rules.encode()).hexdigest()[:16])
+
     def collect_board(self, board: q.Board) -> str:
         """Poll one board; returns ok | failed | backpressure | lost."""
         def queue_filters(conn, report):
@@ -244,10 +253,12 @@ class Worker:
                               wait=self.cfg.byte_wait) as meter:
                 collector = self.collector_factory(board.collector, board.board, company=board.name,
                                                    client=self.http)
+                wants, policy = self.detail_policy()
                 report = run_collector(self.engine, collector, after_ingest=queue_filters,
                                        record_unchanged=False,
                                        ingest_max_age_days=self.settings.ingestion.max_age_days,
-                                       known_snapshot=board.snapshot_hash)
+                                       known_snapshot=board.snapshot_hash,
+                                       wants_detail=wants, detail_policy=policy)
                 nbytes = meter.total
                 pressured = meter.backpressure
         except BackpressureError:

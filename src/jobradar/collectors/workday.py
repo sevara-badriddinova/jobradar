@@ -41,6 +41,12 @@ class WorkdayCollector(JobCollector):
     reuses_known_details = "jobPostingInfo"
     volatile_keys = ("postedOn",)   # "Posted N Days Ago" ticks daily
     max_pages = 1000
+    # Details cost one request per fresh posting. Check the listing digest
+    # before any of them, and fetch them only for titles the filters keep:
+    # big boards (hundreds of fresh postings) exhausted the shared byte budget
+    # every poll and were retried every minute without finishing.
+    title_first = True
+    early_digest = True
 
     def collect(self) -> list[Job]:
         shard, tenant, site = decode_board(self.board)
@@ -92,12 +98,14 @@ class WorkdayCollector(JobCollector):
         if not records and not self.complete_snapshot:
             raise CollectorError("no usable Workday postings in partial search results")
 
+        self.check_listing_digest(records)
+
         def detail(item):
             # This relative label can safely rule out an old job, but cannot
             # establish a fresh publication timestamp. Unknown/localized labels
             # always get the absolute startDate from the detail endpoint.
             old = re.fullmatch(r"Posted (\d+)\+? Days Ago", item.get("postedOn", ""))
-            if old and int(old[1]) > 3:
+            if (old and int(old[1]) > 3) or not self.needs_detail(item.get("title")):
                 # Keep details fetched while it was fresh. Dropping them would
                 # erase the stored description and startDate as a "change".
                 stored = self.known.get(self.board + ":" + item["externalPath"], {}).get("jobPostingInfo")

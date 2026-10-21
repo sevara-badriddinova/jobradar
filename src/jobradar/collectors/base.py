@@ -4,7 +4,7 @@ import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
 from datetime import UTC, datetime, timedelta
-from typing import Any, ClassVar
+from typing import Callable, Any, ClassVar
 
 import httpx
 from pydantic import ValidationError
@@ -114,6 +114,33 @@ class JobCollector(ABC):
         self.known_digest: str | None = None
         self.digest_salt: str = ""
         self.snapshot_digest: str | None = None
+        # Title-first detail fetching (collectors with `title_first`): the worker
+        # sets this to its title filter; details are fetched only for postings
+        # whose listing title passes. None (legacy poll, tests) fetches all.
+        self.wants_detail: Callable[[str], bool] | None = None
+        # Set by collectors with `early_digest` from the listing records before
+        # any detail request; normalize_all then reuses it.
+        self._listing_digest: str | None = None
+
+    # Collectors whose per-posting detail requests can be skipped for titles the
+    # filters reject anyway, and which may check an unchanged listing digest
+    # before fetching any detail.
+    title_first: ClassVar[bool] = False
+    early_digest: ClassVar[bool] = False
+
+    def needs_detail(self, title: Any) -> bool:
+        """False only when the listing title is known and the title filter rejects it."""
+        if self.wants_detail is None or not isinstance(title, str) or not title.strip():
+            return True
+        return bool(self.wants_detail(title))
+
+    def check_listing_digest(self, records: list[Any]) -> None:
+        """Early unchanged check over listing records (before details are fetched).
+        Raises UnchangedSnapshot; otherwise remembers the digest for normalize_all."""
+        digest = self.records_digest(records)
+        if digest is not None and digest == self.known_digest:
+            raise UnchangedSnapshot(digest, len(records))
+        self._listing_digest = digest
 
     @abstractmethod
     def collect(self) -> list[Job]:
@@ -158,9 +185,14 @@ class JobCollector(ABC):
     def normalize_all(self, records: list[Any]) -> list[Job]:
         # Digest first: an identical listing needs no HTML-to-text parsing at all
         # (normalization was the largest CPU cost of unchanged polls).
-        self.snapshot_digest = self.records_digest(records)
-        if self.snapshot_digest is not None and self.snapshot_digest == self.known_digest:
-            raise UnchangedSnapshot(self.snapshot_digest, len(records))
+        if self._listing_digest is not None:
+            # Compared before details were fetched. A partial hydration must not
+            # store a digest that claims a complete snapshot.
+            self.snapshot_digest = self._listing_digest if self.complete_snapshot else None
+        else:
+            self.snapshot_digest = self.records_digest(records)
+            if self.snapshot_digest is not None and self.snapshot_digest == self.known_digest:
+                raise UnchangedSnapshot(self.snapshot_digest, len(records))
         jobs: list[Job] = []
         for raw in records:
             # Record-level failure isolation: one malformed posting is logged
