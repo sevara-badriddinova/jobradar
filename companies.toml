@@ -85658,3 +85658,1582 @@ collector = "workable"
 board = "zyte"
 priority = 3
 enabled = true
+
+# --- Added 2026-10-21 (coverage audit): boards on supported ATSs found in live
+# SimplifyJobs new-grad software/AI listings, plus separate Workday early-career
+# sites of employers already monitored. Initial scans are backfill (no alert flood).
+
+[[company]]
+name = "AiPrise"
+collector = "ashby"
+board = "aiprise"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Aurora Innovation"
+collector = "ashby"
+board = "aurora-operations-inc"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Backbone Systems"
+collector = "ashby"
+board = "backbone"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Chalk"
+collector = "ashby"
+board = "chalk"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Collinear AI"
+collector = "ashby"
+board = "collinear-ai"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Color"
+collector = "ashby"
+board = "color-health"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Dipper"
+collector = "ashby"
+board = "dipper"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Dome Systems Inc"
+collector = "ashby"
+board = "dome-systems-inc"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Droyd Robotics"
+collector = "ashby"
+board = "droyd"
+priority = 3
+enabled = true
+
+[[company]]
+name = "endeavorai.com"
+collector = "ashby"
+board = "endeavorai"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Fireworks AI"
+collector = "ashby"
+board = "fireworks"
+priority = 3
+enabled = true
+
+[[company]]
+name = "FS Studio"
+collector = "ashby"
+board = "fs-studio"
+priority = 3
+enabled = true
+
+[[company]]
+name = "FSH Technologies"
+collector = "ashby"
+board = "fsh"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Hipp Health"
+collector = "ashby"
+board = "hipp"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Hooglee"
+collector = "ashby"
+board = "hooglee"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Humanoid"
+collector = "ashby"
+board = "humanoid"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Idler"
+collector = "ashby"
+board = "idler"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Lance"
+collector = "ashby"
+board = "lance"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Lucid Computing"
+collector = "ashby"
+board = "lucidcomputing"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Mach9"
+collector = "ashby"
+board = "mach9"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Makai Labs"
+collector = "ashby"
+board = "makai-labs"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Monogram"
+collector = "ashby"
+board = "monogram"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Cybernetic Labs"
+collector = "ashby"
+board = "netic"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Nova Talent"
+collector = "ashby"
+board = "nova-talent"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Prelim"
+collector = "ashby"
+board = "prelim"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Quantcast"
+collector = "ashby"
+board = "quantcast"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Qumulo"
+collector = "ashby"
+board = "qumulo"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Rollout"
+collector = "ashby"
+board = "rollout"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Sciemo"
+collector = "ashby"
+board = "sciemo"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Sim"
+collector = "ashby"
+board = "sim"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Simile"
+collector = "ashby"
+board = "simile"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Surge AI"
+collector = "ashby"
+board = "surge-ai"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Synhawk"
+collector = "ashby"
+board = "synhawk"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Unlimited"
+collector = "ashby"
+board = "unlimitedindustries"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Vmax AI Corp"
+collector = "ashby"
+board = "vmax"
+priority = 3
+enabled = true
+
+[[company]]
+name = "The Voleon Group"
+collector = "ashby"
+board = "voleon"
+priority = 3
+enabled = true
+
+[[company]]
+name = "WhatNot"
+collector = "ashby"
+board = "whatnot"
+priority = 3
+enabled = true
+
+[[company]]
+name = "AQR Capital Management"
+collector = "greenhouse"
+board = "aqr"
+priority = 3
+enabled = true
+
+[[company]]
+name = "ASSYST"
+collector = "greenhouse"
+board = "assystinc"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Astera Labs"
+collector = "greenhouse"
+board = "asteraearlycareer2027"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Authentic"
+collector = "greenhouse"
+board = "authenticinsurance"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Babel Street"
+collector = "greenhouse"
+board = "babelstreet"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Bot Auto"
+collector = "greenhouse"
+board = "botauto"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Chicago Trading Company"
+collector = "greenhouse"
+board = "chicagotradingcampus"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Anthropic"
+collector = "greenhouse"
+board = "claudecorps"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Major League Baseball"
+collector = "greenhouse"
+board = "clevelandguardiansbops"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Constant Contact"
+collector = "greenhouse"
+board = "constantcontact"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Chicago Trading Company"
+collector = "greenhouse"
+board = "ctccampusboard"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Dark Wolf Solutions"
+collector = "greenhouse"
+board = "darkwolfsolutions"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Datacor"
+collector = "greenhouse"
+board = "datacor"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Duolingo"
+collector = "greenhouse"
+board = "duolingounirecruitment"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Elwood Technologies"
+collector = "greenhouse"
+board = "elwoodtechnologies"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Evolver"
+collector = "greenhouse"
+board = "evolver"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Faraday Future"
+collector = "greenhouse"
+board = "faradayfuture"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Five Rings Capital"
+collector = "greenhouse"
+board = "fiveringsllc"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Fospha"
+collector = "greenhouse"
+board = "fosphamarketing"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Freedom Technology Solutions Group"
+collector = "greenhouse"
+board = "freedomconsulting"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Gas South"
+collector = "greenhouse"
+board = "gassouth"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Notability"
+collector = "greenhouse"
+board = "gingerlabsinc"
+priority = 3
+enabled = true
+
+[[company]]
+name = "HELLBENDER"
+collector = "greenhouse"
+board = "hellbenderinc"
+priority = 3
+enabled = true
+
+[[company]]
+name = "ID.me"
+collector = "greenhouse"
+board = "idmeuniversityrecruiting"
+priority = 3
+enabled = true
+
+[[company]]
+name = "InstaLILY"
+collector = "greenhouse"
+board = "instalilyai"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Klaviyo"
+collector = "greenhouse"
+board = "klaviyocampus"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Mach Industries"
+collector = "greenhouse"
+board = "machindustries"
+priority = 3
+enabled = true
+
+[[company]]
+name = "McMaster-Carr"
+collector = "greenhouse"
+board = "mcmastercarr"
+priority = 3
+enabled = true
+
+[[company]]
+name = "SambaNova Systems"
+collector = "greenhouse"
+board = "sambanovasystems"
+priority = 3
+enabled = true
+
+[[company]]
+name = "TeleTracking"
+collector = "greenhouse"
+board = "teletrackingtechnologiesinc"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Agile Defense"
+collector = "lever"
+board = "agile-defense"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Analytic Partners"
+collector = "lever"
+board = "analyticpartners"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Appen"
+collector = "lever"
+board = "appen-2"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Artera"
+collector = "lever"
+board = "artera-2"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Bloom & Wild Group"
+collector = "lever"
+board = "bloomon"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Brillio"
+collector = "lever"
+board = "brillio-2"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Crest Industries"
+collector = "lever"
+board = "crestoperations"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Datalab USA"
+collector = "lever"
+board = "datalabusa"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Demiurge Studios"
+collector = "lever"
+board = "demiurgestudios"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Eastern Research Group"
+collector = "lever"
+board = "erg"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Field AI"
+collector = "lever"
+board = "field-ai"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Global Lending Services"
+collector = "lever"
+board = "glsllc"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Health Services Advisory Group"
+collector = "lever"
+board = "hsag"
+priority = 3
+enabled = true
+
+[[company]]
+name = "ION Group"
+collector = "lever"
+board = "ion"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Kitware"
+collector = "lever"
+board = "kitware"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Rainmaker"
+collector = "lever"
+board = "make-rain"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Match Group"
+collector = "lever"
+board = "matchgroup"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Mendix"
+collector = "lever"
+board = "mendix"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Metergy Solutions"
+collector = "lever"
+board = "metergysolutions"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Perr&Knight"
+collector = "lever"
+board = "perrknight"
+priority = 3
+enabled = true
+
+[[company]]
+name = "PlusAI"
+collector = "lever"
+board = "plus-2"
+priority = 3
+enabled = true
+
+[[company]]
+name = "PointClickCare"
+collector = "lever"
+board = "pointclickcare"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Promise Robotics"
+collector = "lever"
+board = "promiserobotics"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Revenue Analytics"
+collector = "lever"
+board = "revenueanalytics"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Rover"
+collector = "lever"
+board = "rover"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Laminar"
+collector = "lever"
+board = "runlaminar"
+priority = 3
+enabled = true
+
+[[company]]
+name = "RWS"
+collector = "lever"
+board = "rws"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Schmidt Sciences"
+collector = "lever"
+board = "schmidt-entities"
+priority = 3
+enabled = true
+
+[[company]]
+name = "SEP"
+collector = "lever"
+board = "sep"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Spry Methods"
+collector = "lever"
+board = "sprymethods"
+priority = 3
+enabled = true
+
+[[company]]
+name = "SteerBridge"
+collector = "lever"
+board = "steerbridge"
+priority = 3
+enabled = true
+
+[[company]]
+name = "AHEAD"
+collector = "lever"
+board = "thinkahead"
+priority = 3
+enabled = true
+
+[[company]]
+name = "True Environmental"
+collector = "lever"
+board = "true-environmental"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Vitana Pediatric & Orthodontic Partners"
+collector = "lever"
+board = "vitana-pediatric"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Welo Global"
+collector = "lever"
+board = "weloglobal"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Wyetech"
+collector = "lever"
+board = "wyetechllc"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Zopa"
+collector = "lever"
+board = "zopa"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Citylogix"
+collector = "rippling"
+board = "citylogix"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Critical Response Group"
+collector = "rippling"
+board = "critical-response-group"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Momentum Engineering"
+collector = "rippling"
+board = "momentumcareers"
+priority = 3
+enabled = true
+
+[[company]]
+name = "StudyFetch"
+collector = "rippling"
+board = "studyfetch"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Supernova Technology"
+collector = "rippling"
+board = "supernova-technology"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Zededa"
+collector = "rippling"
+board = "zededa"
+priority = 3
+enabled = true
+
+[[company]]
+name = "CWILL"
+collector = "workable"
+board = "cwill-us"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Grayce"
+collector = "workable"
+board = "grayce"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Homey"
+collector = "workable"
+board = "homey"
+priority = 3
+enabled = true
+
+[[company]]
+name = "InterImage"
+collector = "workable"
+board = "interimage"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Node.Digital"
+collector = "workable"
+board = "node"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Oxford Quantum Circuits"
+collector = "workable"
+board = "oxford-quantum-circuits-8"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Porsche"
+collector = "workable"
+board = "porsche-retail-group"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Saalex"
+collector = "workable"
+board = "saalex"
+priority = 3
+enabled = true
+
+[[company]]
+name = "SciTec"
+collector = "workable"
+board = "scitec"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Scientific Systems"
+collector = "workable"
+board = "ssci"
+priority = 3
+enabled = true
+
+[[company]]
+name = "SZNS Solutions"
+collector = "workable"
+board = "szns"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Teserac"
+collector = "workable"
+board = "teserac-inc"
+priority = 3
+enabled = true
+
+[[company]]
+name = "The Anywhere"
+collector = "workable"
+board = "the-anywhere-company"
+priority = 3
+enabled = true
+
+[[company]]
+name = "UBDS Group"
+collector = "workable"
+board = "ubds"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Viridien"
+collector = "workday"
+board = "wd103:cgg:766972696469656e63617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "G-Research"
+collector = "workday"
+board = "wd103:gresearch:472d5265736561726368"
+priority = 3
+enabled = true
+
+[[company]]
+name = "JD.com"
+collector = "workday"
+board = "wd103:jd:43616d7075735f4361726565725f53697465"
+priority = 2
+enabled = true
+
+[[company]]
+name = "Analytical Mechanics Associates"
+collector = "workday"
+board = "wd12:amainc:616d615f63617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Salesforce"
+collector = "workday"
+board = "wd12:salesforce:467574757265666f7263655f4e657747726164526f6c6573"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Wilbur-Ellis"
+collector = "workday"
+board = "wd12:wilburellis:77696c6275722d656c6c6973"
+priority = 3
+enabled = true
+
+[[company]]
+name = "AllianceBernstein"
+collector = "workday"
+board = "wd1:abglobal:616263616d70757363617265657273"
+priority = 2
+enabled = true
+
+[[company]]
+name = "Cleveland-Cliffs"
+collector = "workday"
+board = "wd1:aksteel:63617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Booz Allen"
+collector = "workday"
+board = "wd1:bah:436f6e666964656e7469616c"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Baird"
+collector = "workday"
+board = "wd1:baird:63617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Barr"
+collector = "workday"
+board = "wd1:barr:6261727263617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Blackstone"
+collector = "workday"
+board = "wd1:blackstone:426c61636b73746f6e655f43616d7075735f43617265657273"
+priority = 2
+enabled = true
+
+[[company]]
+name = "Boeing"
+collector = "workday"
+board = "wd1:boeing:65787465726e616c5f73756273696469617279"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Cadence Design Systems"
+collector = "workday"
+board = "wd1:cadence:556e69765f43617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Cadence Design Systems"
+collector = "workday"
+board = "wd1:cadence:556e69766572736974795f54616c656e74"
+priority = 2
+enabled = true
+
+[[company]]
+name = "Cadence Design Systems"
+collector = "workday"
+board = "wd1:cadence:556e69766572736974795f54616c656e745f4e4347"
+priority = 2
+enabled = true
+
+[[company]]
+name = "CoStar Group"
+collector = "workday"
+board = "wd1:costar:436f737461725f43616d707573"
+priority = 2
+enabled = true
+
+[[company]]
+name = "Curtiss-Wright Corporation"
+collector = "workday"
+board = "wd1:curtisswright:63775f65787465726e616c5f6361726565725f73697465"
+priority = 3
+enabled = true
+
+[[company]]
+name = "CyrusOne"
+collector = "workday"
+board = "wd1:cyrusone:43797275734f6e65436172656572506f7274616c"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Dutch Bros"
+collector = "workday"
+board = "wd1:dutchbros:444253686f7073"
+priority = 3
+enabled = true
+
+[[company]]
+name = "EisnerAmper"
+collector = "workday"
+board = "wd1:eisneramper:4569736e6572416d7065724561726c7943617265657273"
+priority = 2
+enabled = true
+
+[[company]]
+name = "Everfox"
+collector = "workday"
+board = "wd1:evergreenix:65787465726e616c2d6361726565727332"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Exelixis"
+collector = "workday"
+board = "wd1:exelixis:6578656c"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Fannie Mae"
+collector = "workday"
+board = "wd1:fanniemae:46616e6e69654d616543617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Fidelity Investments"
+collector = "workday"
+board = "wd1:fmr:7461726765746564"
+priority = 3
+enabled = true
+
+[[company]]
+name = "FormFactor"
+collector = "workday"
+board = "wd1:formfactor:4646492d43617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Bank of America"
+collector = "workday"
+board = "wd1:ghr:75732d656d706c7376"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Health Research"
+collector = "workday"
+board = "wd1:healthresearch:6872695f63617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Kraft Heinz"
+collector = "workday"
+board = "wd1:heinz:4b726166744865696e7a5f436172656572735f4243"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Horizon media"
+collector = "workday"
+board = "wd1:horizonmedia:4361726565724f70706f7274756e6974696573"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Insitu"
+collector = "workday"
+board = "wd1:insitu:63617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "KLA"
+collector = "workday"
+board = "wd1:kla:5552"
+priority = 3
+enabled = true
+
+[[company]]
+name = "KLA"
+collector = "workday"
+board = "wd1:kla:616e6e6172626f72"
+priority = 2
+enabled = true
+
+[[company]]
+name = "Mastercard"
+collector = "workday"
+board = "wd1:mastercard:43616d707573"
+priority = 2
+enabled = true
+
+[[company]]
+name = "NCR Voyix"
+collector = "workday"
+board = "wd1:ncr:6578745f6e6f6e5f7573"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Nidec"
+collector = "workday"
+board = "wd1:nidec:6e69646563"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Netsmart"
+collector = "workday"
+board = "wd1:ntst:63617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Onto Innovation"
+collector = "workday"
+board = "wd1:onto:6f6e746f5f63617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "PJT Partners"
+collector = "workday"
+board = "wd1:pjtpartners:43617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Pennsylvania State University"
+collector = "workday"
+board = "wd1:psu:5053555f5374616666"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Sentry Insurance"
+collector = "workday"
+board = "wd1:sentryinsurance:53656e74727943617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Signet Jewelers"
+collector = "workday"
+board = "wd1:signetjewelers:5369676e6574436f72706f7261746543617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Southwest Airlines"
+collector = "workday"
+board = "wd1:swa:65787465726e616c"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Texas A&M University System"
+collector = "workday"
+board = "wd1:tamus:53797374656d2d776964655f45787465726e616c"
+priority = 3
+enabled = true
+
+[[company]]
+name = "T.D. Williamson"
+collector = "workday"
+board = "wd1:tdwilliamson:54445743617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "University of Texas at Austin"
+collector = "workday"
+board = "wd1:utaustin:757473747564656e74"
+priority = 2
+enabled = true
+
+[[company]]
+name = "University of Virginia"
+collector = "workday"
+board = "wd1:uva:75766173747564656e746a6f6273"
+priority = 2
+enabled = true
+
+[[company]]
+name = "Ribbon"
+collector = "workday"
+board = "wd1:vhr-genband:726962626f6e63617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Viavi Solutions"
+collector = "workday"
+board = "wd1:viavisolutions:63617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Bird Construction"
+collector = "workday"
+board = "wd3:bird:42697264436f6e737472756374696f6e43617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Bank of Montreal"
+collector = "workday"
+board = "wd3:bmo:43616d707573"
+priority = 2
+enabled = true
+
+[[company]]
+name = "BP"
+collector = "workday"
+board = "wd3:bpinternational:62704561726c7943617265657273"
+priority = 2
+enabled = true
+
+[[company]]
+name = "Cenovus Energy"
+collector = "workday"
+board = "wd3:cenovus:63617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Howden"
+collector = "workday"
+board = "wd3:hyperiongrp:4879706572696f6e5f45787465726e616c"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Intact"
+collector = "workday"
+board = "wd3:intactfc:696e746163746663"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Kainos"
+collector = "workday"
+board = "wd3:kainos:6b61696e6f73"
+priority = 3
+enabled = true
+
+[[company]]
+name = "LSEG"
+collector = "workday"
+board = "wd3:lseg:47726164756174655f43617265657273"
+priority = 2
+enabled = true
+
+[[company]]
+name = "MBDA"
+collector = "workday"
+board = "wd3:mbda:4d4244412d554b"
+priority = 3
+enabled = true
+
+[[company]]
+name = "RELX"
+collector = "workday"
+board = "wd3:relx:72656c78"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Perseus Group"
+collector = "workday"
+board = "wd3:talentmanagementsolution:706572736575732d63617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Global"
+collector = "workday"
+board = "wd3:thisisglobal:476c6f62616c"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Zeiss"
+collector = "workday"
+board = "wd3:zeissgroup:45787465726e616c"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Centric Software"
+collector = "workday"
+board = "wd501:centricsoftware:43656e74726963"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Alation"
+collector = "workday"
+board = "wd503:alation:45787465726e616c53697465"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Acxiom"
+collector = "workday"
+board = "wd5:acxiomllc:416378696f6d555341"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Aderant"
+collector = "workday"
+board = "wd5:aderant:41646572616e745f45787465726e616c5f43617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "The Aerospace Corporation"
+collector = "workday"
+board = "wd5:aero:65787465726e616c"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Auto-Owners Insurance"
+collector = "workday"
+board = "wd5:aoins:4175746f4f776e657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "AspenTech"
+collector = "workday"
+board = "wd5:aspentech:617370656e74656368"
+priority = 3
+enabled = true
+
+[[company]]
+name = "AssetMark"
+collector = "workday"
+board = "wd5:assetmark:41737365744d61726b5f43617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Axos Bank"
+collector = "workday"
+board = "wd5:axos:41786f73"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Blue Cross of Idaho"
+collector = "workday"
+board = "wd5:bcidaho:424349"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Blue Origin"
+collector = "workday"
+board = "wd5:blueorigin:626c75656f726967696e"
+priority = 3
+enabled = true
+
+[[company]]
+name = "CHEP"
+collector = "workday"
+board = "wd5:brambles:4272616d626c65735f43617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Chevron Corporation"
+collector = "workday"
+board = "wd5:chevron:556e6976657273697479"
+priority = 2
+enabled = true
+
+[[company]]
+name = "Choice Hotels"
+collector = "workday"
+board = "wd5:choicehotels:45787465726e616c"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Cincinnati Children’s Hospital and Medical Center"
+collector = "workday"
+board = "wd5:cincinnatichildrens:63617265657273617463696e63696e6e6174696368696c6472656e73"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Dealer Tire"
+collector = "workday"
+board = "wd5:dealertire:4465616c6572546972654c4c432d43617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Deluxe"
+collector = "workday"
+board = "wd5:deluxe:5553415f43414e"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Gentex Corporation"
+collector = "workday"
+board = "wd5:gentex:47656e746578"
+priority = 3
+enabled = true
+
+[[company]]
+name = "GE Vernova"
+collector = "workday"
+board = "wd5:gevernova:6f6e6c795f636f6e666964656e7469616c5f6578656375746976655f72656372756974696e67"
+priority = 3
+enabled = true
+
+[[company]]
+name = "HNTB"
+collector = "workday"
+board = "wd5:hntb:686e74625f63617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Hewlett Packard"
+collector = "workday"
+board = "wd5:hp:45585445552d41432d43617265657253697465"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Hewlett Packard Enterprise"
+collector = "workday"
+board = "wd5:hpe:61636a6f6273697465"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Interdigital"
+collector = "workday"
+board = "wd5:interdigital:496e7465724469676974616c5f436172656572"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Omnicom Group"
+collector = "workday"
+board = "wd5:interpublic:6f6d63"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Kyndryl"
+collector = "workday"
+board = "wd5:kyndryl:4b796e6472796c4561726c7943617265657273"
+priority = 2
+enabled = true
+
+[[company]]
+name = "Living Spaces"
+collector = "workday"
+board = "wd5:livingspaces:6c73"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Mimecast"
+collector = "workday"
+board = "wd5:mimecast:4d696d65636173742d43617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "MSI Express"
+collector = "workday"
+board = "wd5:msiexpress:4d53495f457870726573735f45787465726e616c5f43617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "M&T Bank"
+collector = "workday"
+board = "wd5:mtb:43616d707573"
+priority = 2
+enabled = true
+
+[[company]]
+name = "Hyatt Vacation Club"
+collector = "workday"
+board = "wd5:mymvw:68766f63617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "National Laboratory of the Rockies"
+collector = "workday"
+board = "wd5:nrel:4e4c52"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Amerisure"
+collector = "workday"
+board = "wd5:osv-amerisure:416d65726973757265"
+priority = 3
+enabled = true
+
+[[company]]
+name = "OU Health"
+collector = "workday"
+board = "wd5:oumedicine:4f554865616c746843617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Power Design"
+collector = "workday"
+board = "wd5:powerdesigninc:504449"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Sallie Mae"
+collector = "workday"
+board = "wd5:sallie-mae:43617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Thrivent"
+collector = "workday"
+board = "wd5:thrivent:65787465726e616c"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Underwriters Laboratories"
+collector = "workday"
+board = "wd5:ulse:756c726963617265657273"
+priority = 3
+enabled = true
+
+[[company]]
+name = "Visa"
+collector = "workday"
+board = "wd5:visa:566973615f4561726c795f43617265657273"
+priority = 2
+enabled = true
+
+[[company]]
+name = "ZRS Management"
+collector = "workday"
+board = "wd5:zrsmanagement:7a72735f63617265657273"
+priority = 3
+enabled = true
