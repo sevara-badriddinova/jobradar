@@ -7,7 +7,7 @@ implemented locally with tests; nothing is deployed.
 |---|-----|--------|-----------|
 | 1 | Fair board scheduling across providers; 4 h default revisit | fix1 | none |
 | 2 | Sweep reads only pending rows; content rejections never rewritten | fix2 | 0013 (index) |
-| 3 | Title-first detail fetching; early listing digests (Workday, Rippling, Personio) | fix3 | none |
+| 3 | Title-first details (Workday, Personio); early listing digests (Workday, Rippling) | fix3, review | none |
 | 4 | Sponsorship: support → AI, refusal → reject, not stated → review queue | fix4 | 0014 (table + data step) |
 | 5 | Freshness by employer date *or* first sighting; initial scans never alert; repost fix | fix5 | 0015 (column) |
 | 6 | 225 boards on supported ATSs (incl. Workday early-career sites) | fix6 | none (`companies sync`) |
@@ -19,7 +19,8 @@ backlogs took every slot and 3,704 boards (all Lever, Personio, Recruitee,
 Rippling, 768 Workday) were never polled. Slots now alternate between the
 least-recently-served provider (guaranteed rotation: every provider with due
 boards within one rotation) and the most overdue board anywhere (proportional
-share). Revisit is 80 min × priority (4 h for the 12k priority-3 boards ≈ 51
+share). Overdue age in the oldest-board slot is capped at one priority-3
+revisit, so never-polled boards share it after a deploy. Revisit is 80 min × priority (4 h for the 12k priority-3 boards ≈ 51
 boards/min, inside the VM's measured 50–100/min; the old 90 min needed 136/min,
 a permanent backlog).
 
@@ -33,10 +34,13 @@ day). `ix_jobs_expiry_open` (0013) indexes only rows the expiry UPDATEs can
 change. Sweep runs hourly (every job already gets a filter task; delivery
 re-checks freshness at send time).
 
-**3. Details.** Workday/Rippling/Personio fetch one detail per posting. Details are
-now fetched only for listing titles the title filter keeps (~7% of postings);
-Workday and Rippling compare the listing digest before any detail request, so an
-unchanged board costs only its listing pages. Big Workday boards that exhausted
+**3. Details.** Workday/Rippling/Personio fetch one detail per posting. Workday
+and Personio now fetch details only for listing titles the title filter keeps
+(~7% of postings), reusing stored details otherwise; Workday and Rippling compare
+the listing digest before any detail request, so an unchanged board costs only
+its listing pages. Rippling keeps fetching every detail when its listing changed:
+it has no stored-detail reuse, so skipping would replace an existing posting's
+description and date with listing-only fields. Big Workday boards that exhausted
 the shared byte budget every poll (and were retried every minute) now fit. The
 title-rule fingerprint is part of these collectors' digest, so a filter change
 re-hydrates newly relevant titles. Legacy callers without a policy fetch all.
@@ -88,7 +92,8 @@ Workable 14, Rippling 6 (225 in total). Early-career sites get priority 2.
 - **0014** `sponsorship_reviews`; data step makes the last 3 days of
   "no explicit sponsorship" rejections pending again (hundreds of rows).
 - **0015** `jobs.discovered_in_backfill boolean not null default false`
-  (metadata-only in PG 11+).
+  (metadata-only in PG 11+); data step re-queues open "too old" rejections first
+  seen in the last 3 days with an employer date within 30 days.
 - Verified: upgrade 0012 → 0015 → downgrade 0012 → upgrade again on a scratch
   database; the previous release (646482b) ingests, filters and queues
   notifications unchanged on the 0015 schema (it never runs migrations itself;
@@ -96,10 +101,10 @@ Workable 14, Rippling 6 (225 in total). Early-career sites get priority 2.
 
 ## Rollout risks
 
-1. **One full filter recheck.** `max_discovery_age_days` changes the filter policy
-   signature, so the first sweep rechecks every active job once (a heap scan of
-   `jobs`, minutes of disk on pd-standard). Run it in a quiet hour; afterwards
-   sweeps are incremental again.
+1. **No full filter recheck.** The filter policy signature excludes the discovery
+   window (verified: old release + old profile and new release + new profile give
+   the same signature), so deploying does not trigger heap scans of `jobs`. 0014
+   and 0015 re-queue only the recent rows the new rules can change.
 2. **Workday re-ingest.** Workday digests change format (listing vs hydrated), so
    each of ~1,465 Workday boards is fully ingested once (mostly comparisons, few
    writes) over the first 4 h rotation.
@@ -112,8 +117,8 @@ Workable 14, Rippling 6 (225 in total). Early-career sites get priority 2.
 5. **Title-first.** A role whose listing title fails the title filter but whose
    detail title would pass is now stored without details (it was rejected by
    title anyway). A title-filter change re-hydrates automatically.
-6. **Queue (Mini App) delivery** still uses the strict employer-date window; alerts
-   delivery (the configured mode) uses the new rule.
+6. **Mini App** uses the same freshness rule as filtering and alerts (the
+   listener and `notify` pass the discovery window into the queue state).
 7. **companies sync** is a separate production step (`jobradar companies sync`).
 
 ## Unsupported providers (plan, not implemented)
