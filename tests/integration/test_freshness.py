@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from itertools import product
 
 import pytest
-from sqlalchemy import func, select, text, update
+from sqlalchemy import func, select, update
 
 from jobradar.db import jobs as jobs_t, notifications
 from jobradar.filters import run_filters

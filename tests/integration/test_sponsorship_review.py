@@ -13,7 +13,6 @@ from jobradar.notifications import _eligible
 from jobradar.settings import FilterSettings, Preferences
 from jobradar.sponsorship_review import UNKNOWN_REASON
 from tests.factories import assessment, make_job
-from tests.fake_telegram import FakeTelegram
 from tests.integration.helpers import ingest, row
 from tests.integration.test_matcher import add_profile
 from tests.integration.test_migrations import scratch  # noqa: F401 - fixture
