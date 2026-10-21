@@ -220,7 +220,7 @@ def test_migration_requeues_recent_no_explicit_rejections_only(scratch, monkeypa
     config.set_main_option("script_location", "jobradar:migrations")
     with scratch.connect() as conn:          # alembic owns commits (CONCURRENTLY indexes)
         config.attributes["connection"] = conn
-        command.upgrade(config, "0013")
+        command.upgrade(config, "0012")
     ingest(scratch, [posting("recent"), posting("stale", posted_at=NOW - timedelta(days=5), title="X Engineer"),
                      posting("other", title="Senior Engineer")])
     with scratch.begin() as conn:

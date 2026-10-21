@@ -214,7 +214,7 @@ def test_same_snapshot_relisting_is_a_repost_but_partial_snapshots_stay_duplicat
 
 def test_discovery_window_does_not_change_the_filter_policy_signature(engine):
     """Adding/enabling the window must not force a full recheck (heap scans of
-    jobs in one transaction) on deploy; 0015 re-queues the affected rows."""
+    jobs in one transaction) on deploy; 0014 re-queues the affected rows."""
     from jobradar.db import app_state
     def signature(policy):
         with engine.begin() as conn:
@@ -223,7 +223,7 @@ def test_discovery_window_does_not_change_the_filter_policy_signature(engine):
     assert signature(FilterSettings(max_posting_age_days=3)) == signature(POLICY)
 
 
-def test_migration_0015_requeues_only_recent_too_old_rejections(scratch, monkeypatch):
+def test_migration_0014_requeues_only_recent_too_old_rejections(scratch, monkeypatch):
     from alembic import command
     from alembic.config import Config
     from jobradar.db import migrate
@@ -232,7 +232,7 @@ def test_migration_0015_requeues_only_recent_too_old_rejections(scratch, monkeyp
     config.set_main_option("script_location", "jobradar:migrations")
     with scratch.connect() as conn:
         config.attributes["connection"] = conn
-        command.upgrade(config, "0014")
+        command.upgrade(config, "0013")
     ingest(scratch, [make_job(s, title=f"Engineer {s}", posted_at=ago(days=d)) for s, d in
                      [("recent", 8), ("ancient", 60), ("seen_long_ago", 8), ("title", 8)]])
     with scratch.begin() as conn:

@@ -104,13 +104,6 @@ jobs = Table(
         "closed_at IS NULL AND status IN ('DISCOVERED', 'REPOSTED', 'FILTERED', 'MATCHED', 'NOTIFIED') "
         "AND (filtered_at IS NULL OR status <> 'FILTERED' OR filter_reason IS NULL "
         "OR filter_reason NOT LIKE 'posting date:%' OR filter_reason = 'posting date: in the future')")),
-    # Only rows the expiry sweep can change: unfiltered, still-eligible
-    # (DISCOVERED/MATCHED/NOTIFIED), or future-dated. Content-rejected rows are
-    # excluded (they are never relabelled as expired): see 0013.
-    Index("ix_jobs_expiry_open", "posted_at", postgresql_where=text(
-        "closed_at IS NULL AND status IN ('DISCOVERED', 'REPOSTED', 'FILTERED', 'MATCHED', 'NOTIFIED') "
-        "AND (status <> 'FILTERED' OR filtered_at IS NULL OR filter_reason IS NULL "
-        "OR filter_reason = 'posting date: in the future')")),
 )
 
 companies = Table(

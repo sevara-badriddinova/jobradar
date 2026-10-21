@@ -259,7 +259,7 @@ def run_filters(conn: Connection, settings: FilterSettings, *, recheck: bool = F
     jobs, while application facts and review choices are retained.
     """
     # The discovery window is left out on purpose: it only widens freshness for
-    # postings first seen in the last 72 h, which migration 0015 re-queues, and
+    # postings first seen in the last 72 h, which migration 0014 re-queues, and
     # a full recheck (several heap scans of jobs, one transaction) is not worth
     # that on the VM's disk. Including it (even unset) would force one on deploy.
     policy = settings.model_dump(exclude={"max_discovery_age_days"})
@@ -305,7 +305,8 @@ def run_filters(conn: Connection, settings: FilterSettings, *, recheck: bool = F
         # the posting or the policy changes (ingestion clears filtered_at; a
         # policy change rechecks everything), so they are never relabelled as
         # expired: that rewrote thousands of rows a day for nothing and kept
-        # them in the expiry index (0013 indexes exactly this candidate set).
+        # them in the expiry index. This set is a subset of ix_jobs_expiry_active's
+        # predicate (0012), so that small index still serves these UPDATEs.
         expiry_candidates = or_(jobs.c.status != "FILTERED", jobs.c.filtered_at.is_(None),
             jobs.c.filter_reason.is_(None), jobs.c.filter_reason == "posting date: in the future")
         for reason, predicate in reasons:

@@ -76,7 +76,7 @@ def test_empty_incremental_filter_uses_small_indexes(engine):
     assert len(plans) == 4
     assert all("Seq Scan" not in plan for plan in plans)
     assert "ix_jobs_pending_active" in plans[-1]
-    assert all("ix_jobs_expiry_open" in plan for plan in plans[:3])
+    assert all("ix_jobs_expiry_active" in plan for plan in plans[:3])
 
 
 def test_never_filtered_duplicates_do_not_force_sequential_sweeps(engine):

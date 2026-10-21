@@ -6,10 +6,10 @@ implemented locally with tests; nothing is deployed.
 | # | Fix | Commit | Migration |
 |---|-----|--------|-----------|
 | 1 | Fair board scheduling across providers; 4 h default revisit | fix1 | none |
-| 2 | Sweep reads only pending rows; content rejections never rewritten | fix2 | 0013 (index) |
+| 2 | Sweep reads only pending rows; content rejections never rewritten | fix2 | none |
 | 3 | Title-first details (Workday, Personio); early listing digests (Workday, Rippling) | fix3, review | none |
-| 4 | Sponsorship: support → AI, refusal → reject, not stated → review queue | fix4 | 0014 (table + data step) |
-| 5 | Freshness by employer date *or* first sighting; initial scans never alert; repost fix | fix5 | 0015 (column) |
+| 4 | Sponsorship: support → AI, refusal → reject, not stated → review queue | fix4 | 0013 (table + data step) |
+| 5 | Freshness by employer date *or* first sighting; initial scans never alert; repost fix | fix5 | 0014 (column + data step) |
 | 6 | 225 boards on supported ATSs (incl. Workday early-career sites) | fix6 | none (`companies sync`) |
 
 ## What changed and why
@@ -30,8 +30,9 @@ planner walked the date index over every recent open job (~30k heap pages per
 decide 3 jobs). It now uses exactly the `ix_jobs_pending_active` predicate and
 checks the window in Python. Title/visa/experience/location rejections are no
 longer relabelled "posting date: older" as they age (thousands of rewrites a
-day). `ix_jobs_expiry_open` (0013) indexes only rows the expiry UPDATEs can
-change. Sweep runs hourly (every job already gets a filter task; delivery
+day). The remaining expiry candidates are a subset of the existing
+`ix_jobs_expiry_active` predicate (0012, 1.5 MB in production), so no new index
+is needed. Sweep runs hourly (every job already gets a filter task; delivery
 re-checks freshness at send time).
 
 **3. Details.** Workday/Rippling/Personio fetch one detail per posting. Workday
@@ -87,24 +88,24 @@ Workable 14, Rippling 6 (225 in total). Early-career sites get priority 2.
 
 ## Migrations and rollback
 
-- **0013** `ix_jobs_expiry_open` (CONCURRENTLY, re-runnable). 0012 indexes kept so
-  the previous image's sweep still has its index; drop them in a later cleanup.
-- **0014** `sponsorship_reviews`; data step makes the last 3 days of
+- No new index: an earlier draft's 0013 index would have cost two full scans of
+  `jobs` (~8 min of saturated disk) at deploy for no planner benefit.
+- **0013** `sponsorship_reviews`; data step makes the last 3 days of
   "no explicit sponsorship" rejections pending again (hundreds of rows).
-- **0015** `jobs.discovered_in_backfill boolean not null default false`
+- **0014** `jobs.discovered_in_backfill boolean not null default false`
   (metadata-only in PG 11+); data step re-queues open "too old" rejections first
   seen in the last 3 days with an employer date within 30 days.
-- Verified: upgrade 0012 → 0015 → downgrade 0012 → upgrade again on a scratch
+- Verified: upgrade 0012 → 0014 → downgrade 0012 → upgrade again on a scratch
   database; the previous release (646482b) ingests, filters and queues
-  notifications unchanged on the 0015 schema (it never runs migrations itself;
+  notifications unchanged on the 0014 schema (it never runs migrations itself;
   only `init-db` does).
 
 ## Rollout risks
 
 1. **No full filter recheck.** The filter policy signature excludes the discovery
    window (verified: old release + old profile and new release + new profile give
-   the same signature), so deploying does not trigger heap scans of `jobs`. 0014
-   and 0015 re-queue only the recent rows the new rules can change.
+   the same signature), so deploying does not trigger heap scans of `jobs`. 0013
+   and 0014 re-queue only the recent rows the new rules can change.
 2. **Workday re-ingest.** Workday digests change format (listing vs hydrated), so
    each of ~1,465 Workday boards is fully ingested once (mostly comparisons, few
    writes) over the first 4 h rotation.

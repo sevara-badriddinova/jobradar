@@ -10,15 +10,15 @@ Data step: open jobs rejected for "no explicit sponsorship" within the last
 moves them into the queue. Rollback-safe: the previous image re-filters them
 to the same rejection; the new table is simply ignored.
 
-Revision ID: 0014
-Revises: 0013
+Revision ID: 0013
+Revises: 0012
 """
 
 import sqlalchemy as sa
 from alembic import op
 
-revision = "0014"
-down_revision = "0013"
+revision = "0013"
+down_revision = "0012"
 branch_labels = None
 depends_on = None
 

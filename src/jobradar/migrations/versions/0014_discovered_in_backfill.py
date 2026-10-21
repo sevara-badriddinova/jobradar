@@ -11,15 +11,15 @@ table rewrite, brief lock). The previous image ignores the column.
 Data step: re-queue recent "older than" rejections the discovery rule may now
 accept (see upgrade()), instead of a full filter recheck.
 
-Revision ID: 0015
-Revises: 0014
+Revision ID: 0014
+Revises: 0013
 """
 
 import sqlalchemy as sa
 from alembic import op
 
-revision = "0015"
-down_revision = "0014"
+revision = "0014"
+down_revision = "0013"
 branch_labels = None
 depends_on = None
 
