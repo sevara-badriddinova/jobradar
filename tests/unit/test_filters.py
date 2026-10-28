@@ -87,6 +87,24 @@ class TestLocation:
     def test_rejects_when_every_location_is_outside_the_us(self, locations):
         assert location_reason(locations) == f"location: {locations[0]}"
 
+    @pytest.mark.parametrize("locations", [
+        # Workday ISO-3 prefixes and structured country fields next to unknown cities
+        ["DEU - Saxony - Dresden", "Germany"], ["IND - HR - NOIDA"], ["BGR - SOFIA"], ["PHL Quezon City - UP Ayala"],
+        ["Kronberg", "Germany"], ["Qingzhou, Shandong", "China"], ["DLF CYBERCITY 12B", "India"],
+        ["Ha Noi", "Hà Nội", "Vietnam", "VN"], ["Koudekerk aan den Rijn, Zuid-Holland", "Netherlands", "NL"],
+        ["BUCHAREST, , ROMANIA"], ["Athens, Attica, Greece"], ["München"], ["Prague"], ["Remote - Latin America"],
+    ])
+    def test_rejects_jobs_abroad_named_by_country_fields(self, locations):
+        assert location_reason(locations) == f"location: {locations[0]}"
+
+    @pytest.mark.parametrize("locations", [
+        ["USA - Texas - Austin", "United States of America"], ["Client Site - USA - CA - "], ["US, Louisville, CO"],
+        ["Mountain View, 650 Castro"], ["Raleigh", "London"], ["2 Locations", "India"], ["Remote", "Germany"],
+        ["Jersey City"], ["Remote - New England"], ["Melbourne, FL"], ["Athens, GA"], ["PRI - San Juan"],
+    ])
+    def test_us_generic_or_ambiguous_places_still_pass(self, locations):
+        assert location_reason(locations) is None
+
     def test_state_codes_need_the_comma_form(self):
         # "in" / "or" / "me" are English words, not Indiana/Oregon/Maine.
         assert location_reason(["Remote in Europe or Asia"]) is not None
@@ -211,3 +229,34 @@ class TestSponsorship:
                    description="We are unable to sponsor visas.", raw={}, settings=DEFAULTS)
         assert reject_reason(**job) is None
         assert reject_reason(**job, needs_sponsorship=True) == 'visa: "unable to sponsor"'
+
+
+# --- Oct 28 additions: titles seen in production ----------------------------------------------
+
+@pytest.mark.parametrize("title", [
+    "Software Engineer Co-op", "Software Engineer Full Stack / Backend I (Co-op) - United States",
+    "SONiC Software Design Engineer- New College Grad 2025", "Site Reliability Engineer",
+    "Production Engineer", "Systems Software Engineer, Silicon Bringup", "Platform Software Engineer 2",
+    "Backend Engineer, Data Ingestion", "Software Developer - ERP Applications",
+    "Member of Technical Staff (Software Engineer, GPU Cluster Infrastructure)",
+])
+def test_oct28_exclusions_keep_software_roles(title):
+    assert title_reason(title, DEFAULTS) is None
+
+
+@pytest.mark.parametrize("title,phrase", [
+    ("Field Service Engineer II (C2)", "field service"),
+    ("Supplier Quality Engineer II", "quality engineer"),
+    ("(USA) Process Engineer", "process engineer"),
+    ("Controls Engineer", "controls engineer"),
+    ("ASIC Design Verification Engineer II", "asic"),
+    ("RF Engineer I - New Grad (R6108)", "rf"),
+    ("Systems Engineering Technician", "technician"),
+    ("Associate Utility Engineer", "utility engineer"),
+    ("T&D Planning Engineer", "planning engineer"),
+    ("CAD Engineer - AI Trainer", "ai trainer"),
+    ("Presales System Engineer - K12 and Local Government - Utah", "presales"),
+    ("Data Centre - Commissioning Engineer (Mission Critical)", "commissioning"),
+])
+def test_oct28_exclusions_reject_non_software_engineering(title, phrase):
+    assert title_reason(title, DEFAULTS) == f"title: {phrase}"

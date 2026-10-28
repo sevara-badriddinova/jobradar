@@ -19,3 +19,14 @@ def row(engine, sid, source="greenhouse"):
 def count(engine, *where):
     with engine.connect() as conn:
         return conn.execute(select(func.count()).select_from(jobs_t).where(*where)).scalar_one()
+
+
+def ingest_with_an_older_schema(monkeypatch):
+    """Let today's ingestion write into a schema from before newer optional
+    columns (discovered_in_backfill, raw_digest), as the migration tests need."""
+    from sqlalchemy import literal
+    from jobradar import repository
+    monkeypatch.setattr(repository, "_is_initial_scan", lambda *a: False)
+    monkeypatch.setattr(repository, "_pruned", lambda: literal(False))
+    monkeypatch.setattr(repository, "_raw_changed", lambda payload, source: repository._stable(
+        repository.jobs_t.c.raw, source).is_distinct_from(repository._stable(payload, source)))

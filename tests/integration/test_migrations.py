@@ -103,7 +103,9 @@ def test_review_migration_preserves_previous_button_choices(scratch):
 def test_publication_migration_removes_update_fallback_and_preserves_original_date(scratch, monkeypatch):
     # Rows are ingested into an older schema with today's code: leave out the
     # newer discovered_in_backfill column (written only for initial scans).
-    monkeypatch.setattr("jobradar.repository._is_initial_scan", lambda *a: False)
+    # ... and the newer raw_digest column (set only on pruned rows).
+    from tests.integration.helpers import ingest_with_an_older_schema
+    ingest_with_an_older_schema(monkeypatch)
     from datetime import UTC, datetime
     from alembic import command
     from jobradar.db import jobs

@@ -95,14 +95,21 @@ The current profile sends **new Telegram alerts** for qualifying matches and ret
 Telegram's **Menu** button or `/menu`, choose **🆕 New / ❤️ Liked / ✅ Applied / ⏭️ Skipped**, and tap a
 job by name. Its details and **Like**, **Not interested**, **Mark applied**, and
 **Sponsorship required** actions appear in the same message. **Open application**
-opens the posting without marking it applied. Pagination, choices, and new
+opens the posting without marking it applied. Choosing Applied, Not interested,
+Add to queue or Sponsorship required on an alert saves the choice and removes the
+alert from the chat (Telegram allows this for 48 hours; older alerts collapse to one
+line). In the queue message, a choice returns you to the list. The job stays in its
+Liked / Applied / Skipped list. Pagination, choices, and new
 matches update the existing queue instead of adding more messages.
 Use **🏠 Main menu** to switch lists and **⬅️ Back to jobs** to leave a job's details.
 Jobs show their posting age, or **Updated** / **First seen** when an original
 posting date is unavailable in review history. The current profile requires a
 known posting date within the last **72 hours** for new and liked jobs, AI scoring,
-and notifications. Each posting must explicitly offer visa sponsorship or STEM OPT
-support; company history, E-Verify alone, and silence do not qualify.
+and notifications. Postings that explicitly refuse sponsorship (or require citizenship
+or clearance) are rejected. Postings that don't mention sponsorship are scored like
+any other and their alerts say **🛂 Sponsorship: not mentioned in the posting**; ones
+that offer it quote the sentence (`require_explicit_sponsorship`, see
+[alerts restored](docs/24-alerts-restored.md)).
 Updates and discovery dates do not qualify. Applied and skipped
 history is retained. Run `jobradar telegram setup-menu` once to configure
 Telegram's menu shortcuts.

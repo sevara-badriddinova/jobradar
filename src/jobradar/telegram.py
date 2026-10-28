@@ -101,6 +101,10 @@ class Telegram:
                   chat_id=chat_id, message_id=message_id,
                   reply_markup={"inline_keyboard": buttons})
 
+    def delete_message(self, chat_id: str | int, message_id: int) -> None:
+        """Telegram lets a bot delete its own messages for 48 hours."""
+        self.call("deleteMessage", http_timeout=3, max_attempts=1, chat_id=chat_id, message_id=message_id)
+
     def get_me(self) -> dict[str, Any]:
         return self.call("getMe")
 

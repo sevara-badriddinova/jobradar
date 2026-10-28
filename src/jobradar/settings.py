@@ -15,6 +15,39 @@ class SettingsError(Exception):
     """profile.toml is invalid."""
 
 
+# The default title exclusions before Oct 28, 2026, in their original order.
+# filters.run_filters recognises a stored filter signature made with this list:
+# adding exclusions can only reject more jobs, so it rechecks just the jobs that
+# are not filtered yet instead of running a full recheck. Keep this unchanged.
+TITLE_EXCLUDE_BEFORE_20261028 = (
+    "senior", "sr", "staff", "principal", "lead", "manager", "director", "head of",
+    "vp", "vice president", "architect", "distinguished", "fellow", "iii", "iv",
+    "intern", "internship",
+    "qa", "quality assurance", "test engineer", "sdet", "sales engineer", "solutions engineer",
+    "support engineer", "customer engineer", "field engineer", "mechanical", "electrical",
+    "civil", "hardware", "manufacturing", "aerodynamics", "aerostructures", "recruiter",
+)
+
+# Added Oct 28, 2026: non-software "engineer" titles that reached AI scoring and
+# scored near zero. Checked against production: none of the 586 roles the user
+# applied to, and no scored job above 45.5, contains one of these. Deliberately
+# absent: "co op" (software co-ops are wanted), "design engineer" (Software Design
+# Engineer), "project engineer", "silicon", "production engineer" (an SRE title).
+TITLE_EXCLUDE_ADDED_20261028 = (
+    "field service", "field applications", "applications engineer",
+    "quality engineer", "supplier quality", "quality control",
+    "process engineer", "process engineering", "process development",
+    "controls engineer", "plant engineer", "plant", "commissioning",
+    "utility engineer", "utilities", "validation engineer",
+    "post silicon", "asic", "fpga", "rtl", "physical design", "design verification",
+    "signal integrity", "rf", "optical", "photonics", "analog", "cqv", "design liaison",
+    "construction", "planning engineer", "structural", "chemical", "environmental", "hvac",
+    "facilities", "maintenance engineer", "technician", "presales", "pre sales",
+    "product support", "talent network", "talent community", "ai trainer", "cad",
+    "substation", "power systems",
+)
+
+
 class FilterSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -32,18 +65,9 @@ class FilterSettings(BaseModel):
         "engineer", "engineering", "developer", "software", "swe", "sde", "programmer",
         "member of technical staff",
     ]
-    # Title must contain none of these (whole words/phrases, case-insensitive).
-    title_must_exclude: list[str] = [
-        # seniority
-        "senior", "sr", "staff", "principal", "lead", "manager", "director", "head of",
-        "vp", "vice president", "architect", "distinguished", "fellow", "iii", "iv",
-        # not a new-grad full-time role
-        "intern", "internship",
-        # not software engineering
-        "qa", "quality assurance", "test engineer", "sdet", "sales engineer", "solutions engineer",
-        "support engineer", "customer engineer", "field engineer", "mechanical", "electrical",
-        "civil", "hardware", "manufacturing", "aerodynamics", "aerostructures", "recruiter",
-    ]
+    # Title must contain none of these (whole words/phrases, case-insensitive):
+    # seniority, internships, and roles that are not software engineering.
+    title_must_exclude: list[str] = [*TITLE_EXCLUDE_BEFORE_20261028, *TITLE_EXCLUDE_ADDED_20261028]
 
 
     @model_validator(mode="after")

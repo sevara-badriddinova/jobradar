@@ -182,12 +182,10 @@ def test_rapid_clicks_are_saved_and_answered_before_edits_and_pending_summaries(
     assert process_updates(engine, tg, CHAT) == 2
     methods = [method for method, _ in server.calls]
     assert methods == ["getUpdates", "answerCallbackQuery", "answerCallbackQuery",
-                       "editMessageReplyMarkup", "sendMessage"]
+                       "deleteMessage", "sendMessage"]     # one removal for both clicks
     with engine.connect() as conn:
         assert conn.execute(select(job_reviews.c.choice)).scalar_one() == "IGNORED"
-    edited = next(payload for method, payload in server.calls if method == "editMessageReplyMarkup")
-    assert any(button["text"] == "✓ Not interested"
-               for buttons in edited["reply_markup"]["inline_keyboard"] for button in buttons)
+    assert server.deleted == [100]
 
 
 def test_large_queue_is_split_and_html_is_escaped(engine):

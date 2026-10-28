@@ -128,7 +128,7 @@ def _mark_failed(conn: Connection, ids: list[int], error: TelegramError) -> None
 
 def send_immediate(engine: Engine, tg: Telegram, chat_id: str, now: datetime | None = None, *,
                    max_posting_age_days=None, require_explicit_sponsorship=False,
-                   discovery_days=None) -> SendResult:
+                   discovery_days=None, needs_sponsorship=False) -> SendResult:
     result, failures_in_a_row = SendResult(), 0
     with engine.connect() as conn:
         ids = conn.execute(select(notifications.c.id).where(
@@ -152,7 +152,8 @@ def send_immediate(engine: Engine, tg: Telegram, chat_id: str, now: datetime | N
                 result.cancelled += 1
                 continue
         try:
-            message_id = tg.send_message(chat_id, job_message(job, now), job_buttons(job))
+            message_id = tg.send_message(chat_id, job_message(job, now, needs_sponsorship=needs_sponsorship),
+                                         job_buttons(job))
         except TelegramError as exc:
             with engine.begin() as conn:
                 _mark_failed(conn, [notification_id], exc)
@@ -174,7 +175,8 @@ def send_immediate(engine: Engine, tg: Telegram, chat_id: str, now: datetime | N
 
 
 def send_digest(engine: Engine, tg: Telegram, chat_id: str, *, max_posting_age_days=None,
-                require_explicit_sponsorship=False, discovery_days=None) -> SendResult:
+                require_explicit_sponsorship=False, discovery_days=None,
+                needs_sponsorship=False) -> SendResult:
     """Send every pending digest notification, grouped into as few messages as possible."""
     result = SendResult()
     with engine.begin() as conn:
@@ -196,7 +198,7 @@ def send_digest(engine: Engine, tg: Telegram, chat_id: str, *, max_posting_age_d
                 items.append((row.id, job))
     items.sort(key=lambda item: (-float(item[1].match_score), item[1].id))
 
-    for text, chunk in digest_messages(items):
+    for text, chunk in digest_messages(items, needs_sponsorship=needs_sponsorship):
         ids, job_ids = [i for i, _ in chunk], [j.id for _, j in chunk]
         try:
             message_id = tg.send_message(chat_id, text, digest_buttons([job for _, job in chunk]))
@@ -266,6 +268,7 @@ def _process_updates(engine: Engine, tg: Telegram, chat_id: str, timeout: int) -
                      .scalar_one_or_none() or 0)
     applied = 0
     edits: dict[int, int] = {}
+    decided: dict[int, str] = {}  # card message id -> saved choice: the card leaves the chat
     for upd in tg.get_updates(offset, timeout=timeout):
         started = time.monotonic()
         # Telegram may redeliver an old update. Never repeat its state change or summary.
@@ -287,6 +290,8 @@ def _process_updates(engine: Engine, tg: Telegram, chat_id: str, timeout: int) -
                 action, selected_id, view, page = navigation
                 if action not in ("open", "list", "menu"):
                     outcome = _apply_feedback(conn, f"{'queue' if action == 'like' else action}:{selected_id}")
+                    if _recorded(outcome):
+                        selected_id = None   # done with this job: back to the list it came from
                 request_queue(conn, chat_id, view=view, page=page, job_id=selected_id, explicit=True)
             elif from_us and not show_queue:
                 outcome = _apply_feedback(conn, query.get("data", ""))
@@ -327,9 +332,16 @@ def _process_updates(engine: Engine, tg: Telegram, chat_id: str, timeout: int) -
                 state = read_state(conn, chat_id)
             if not state or state.get("message_id") != query["message"]["message_id"]:
                 edits[query["message"]["message_id"]] = job_id
+                if _recorded(outcome):
+                    decided[query["message"]["message_id"]] = label
     # Save and acknowledge every click before cosmetic requests. Coalesce rapid
     # clicks on the same card/digest into one edit reflecting its final state.
     for message_id, job_id in edits.items():
+        with engine.connect() as conn:
+            digest = _is_digest(conn, message_id)
+        if message_id in decided and not digest:   # a digest lists other jobs: it stays
+            _remove_card(engine, tg, chat_id, message_id, job_id, decided[message_id])
+            continue
         try:
             with engine.connect() as conn:
                 buttons = _message_buttons(conn, message_id, job_id)
@@ -338,6 +350,42 @@ def _process_updates(engine: Engine, tg: Telegram, chat_id: str, timeout: int) -
             log.info("could not update the message buttons: %s", exc)
     sync_queue(engine, tg, chat_id)
     return applied
+
+
+_RECORDED = {label for _, label in FEEDBACK_ACTIONS.values()}
+
+
+def _recorded(outcome) -> bool:
+    """The press saved its choice (not e.g. "This role is closed...")."""
+    return outcome is not None and outcome[0] in _RECORDED
+
+
+def _is_digest(conn: Connection, message_id: int) -> bool:
+    return conn.execute(select(notifications.c.id).where(
+        notifications.c.channel == CHANNEL, notifications.c.message_id == message_id,
+        notifications.c.kind == "digest").limit(1)).first() is not None
+
+
+def _remove_card(engine: Engine, tg: Telegram, chat_id: str, message_id: int, job_id: int, label: str) -> None:
+    """The choice is saved (the toast already confirmed it): take the alert out
+    of the chat. Telegram lets bots delete messages for 48 hours; an older card
+    collapses to one line without buttons. The job stays in its list
+    (Liked / Applied / Skipped) in the queue menu."""
+    try:
+        tg.delete_message(chat_id, message_id)
+    except TelegramError as exc:
+        if "not found" not in str(exc):          # already gone otherwise
+            try:
+                with engine.connect() as conn:
+                    job = _job(conn, job_id)
+                tg.edit_message(chat_id, message_id, f"{html.escape(label)} · {html.escape(job.company)} — "
+                                f"{html.escape(_clip(job.title, 120))}", [])
+            except TelegramError as again:
+                log.info("could not remove the decided card: %s / %s", exc, again)
+                return
+    with engine.begin() as conn:   # nothing left to refresh on this card
+        conn.execute(update(notifications).where(notifications.c.channel == CHANNEL,
+                     notifications.c.message_id == message_id).values(message_id=None))
 
 
 def _apply_feedback(conn: Connection, data: str) -> tuple[str, str, int, bool] | None:
@@ -395,6 +443,8 @@ def refresh_buttons(engine: Engine, tg: Telegram, chat_id: str) -> int:
             tg.edit_buttons(chat_id, message_id, buttons)
             refreshed += 1
         except TelegramError as exc:
+            if "message to edit not found" in str(exc):
+                continue                      # the card was removed from the chat
             if "message is not modified" not in str(exc):
                 raise
     return refreshed
@@ -417,7 +467,12 @@ def _clip(text: str, limit: int = 200) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def job_message(job: Row, now: datetime | None = None) -> str:
+UNSTATED_SPONSORSHIP = "🛂 Sponsorship: not mentioned in the posting"
+
+
+def job_message(job: Row, now: datetime | None = None, *, needs_sponsorship: bool = False) -> str:
+    """needs_sponsorship: say so when the posting neither offers nor refuses it
+    (refusals never get here; they are rejected by the filters)."""
     e = html.escape
     a = job.assessment or {}
     lines = [
@@ -429,6 +484,8 @@ def job_message(job: Row, now: datetime | None = None) -> str:
         lines.append(f"Published: {job.posted_at:%Y-%m-%d %H:%M UTC}")
     if evidence := sponsorship_evidence(getattr(job, "description", "")):
         lines.append(f"🛂 Posting says: {e(_clip(evidence, 300))}")
+    elif needs_sponsorship:
+        lines.append(UNSTATED_SPONSORSHIP)
     for heading, items in (("Why", a.get("reasons")), ("Concerns", a.get("concerns"))):
         if items:
             lines += ["", f"<b>{heading}</b>", *(f"• {e(_clip(item))}" for item in items[:4])]
@@ -457,7 +514,8 @@ def digest_buttons(selected: list[Row]) -> Buttons:
         [{"text": "View all jobs", "callback_data": "show_queue"}]]
 
 
-def digest_messages(items: list[tuple[int, Row]]) -> list[tuple[str, list[tuple[int, Row]]]]:
+def digest_messages(items: list[tuple[int, Row]], *, needs_sponsorship: bool = False
+                    ) -> list[tuple[str, list[tuple[int, Row]]]]:
     """Split digest entries into messages that fit Telegram's size limit."""
     e = html.escape
     messages, lines, chunk = [], [], []
@@ -470,6 +528,8 @@ def digest_messages(items: list[tuple[int, Row]]) -> list[tuple[str, list[tuple[
             line += f"\n     Published: {job.posted_at:%Y-%m-%d %H:%M UTC}"
         if evidence := sponsorship_evidence(getattr(job, "description", "")):
             line += f"\n     🛂 {e(_clip(evidence, 180))}"
+        elif needs_sponsorship:
+            line += "\n     🛂 Sponsorship not mentioned"
         if chunk and (len(chunk) >= 10 or len("\n\n".join([header, *lines, line])) > MAX_MESSAGE_CHARS - 100):
             messages.append(("\n\n".join([header, *lines]), chunk))
             lines, chunk = [], []

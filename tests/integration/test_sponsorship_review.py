@@ -211,7 +211,8 @@ def test_cli_lists_keeps_and_dismisses(engine, db_env, capsys):
 def test_migration_requeues_recent_no_explicit_rejections_only(scratch, monkeypatch):
     # Rows are ingested into an older schema with today's code: leave out the
     # newer discovered_in_backfill column (written only for initial scans).
-    monkeypatch.setattr("jobradar.repository._is_initial_scan", lambda *a: False)
+    from tests.integration.helpers import ingest_with_an_older_schema
+    ingest_with_an_older_schema(monkeypatch)
     from alembic import command
     from alembic.config import Config
     from jobradar.db import migrate
@@ -243,3 +244,82 @@ def test_two_held_jobs_with_one_fingerprint_in_one_batch(engine):
     assert result.rejected[UNKNOWN_REASON] == 2
     [entry] = held(engine)
     assert entry.job_id == row(engine, "repost").id
+
+
+# --- require_explicit_sponsorship = false: silent postings are scored, not held ----------------
+
+SCORE_SILENT = FilterSettings(max_posting_age_days=3, require_explicit_sponsorship=False)
+
+
+def test_turning_the_requirement_off_releases_held_jobs_without_a_full_recheck(engine):
+    from jobradar.db import app_state
+    from jobradar.filters import _signature
+    ingest(engine, [posting("held"), posting("stale", posted_at=NOW - timedelta(days=5), title="Data Engineer"),
+                    posting("gone", title="Platform Engineer"), posting("senior", title="Senior Engineer")])
+    filter_now(engine)                                   # held under the explicit requirement
+    with engine.begin() as conn:
+        conn.execute(update(jobs_t).where(jobs_t.c.source_job_id == "stale").values(
+            status="FILTERED", filter_reason=UNKNOWN_REASON, filtered_at=func.now()))
+        review.hold(conn, [row(engine, "stale").id])
+        conn.execute(update(jobs_t).where(jobs_t.c.source_job_id == "gone").values(closed_at=func.now()))
+        # Production stores a version-5 signature that includes the old setting.
+        old = _signature(POLICY.model_dump(exclude={"max_discovery_age_days"}), True, version=5)
+        conn.execute(update(app_state).where(app_state.c.key == "filter_context").values(value=old))
+        # A row a full recheck would relabel: content-rejected, and old.
+        conn.execute(update(jobs_t).where(jobs_t.c.source_job_id == "senior").values(
+            posted_at=NOW - timedelta(days=9)))
+    assert {e.state for e in held(engine)} == {"pending"}
+
+    with engine.begin() as conn:
+        result = run_filters(conn, SCORE_SILENT, needs_sponsorship=True)
+    assert result.passed_ids == [row(engine, "held").id]
+    assert row(engine, "held").status == "DISCOVERED" and row(engine, "held").filter_reason is None
+    assert row(engine, "stale").filter_reason == "posting date: older than 3 days"
+    assert row(engine, "gone").filter_reason == UNKNOWN_REASON            # closed jobs are left alone
+    assert row(engine, "senior").filter_reason == "title: senior"         # no full recheck happened
+    assert {(e.state, e.resolution) for e in held(engine)} == {
+        ("resolved", "released: explicit sponsorship no longer required")}
+    with engine.connect() as conn:
+        stored = conn.execute(select(app_state.c.value).where(app_state.c.key == "filter_context")).scalar_one()
+    assert stored == _signature(SCORE_SILENT.model_dump(exclude={"max_discovery_age_days",
+                                                                 "require_explicit_sponsorship"}), True, version=6)
+    with engine.begin() as conn:                         # nothing left to release: a no-op
+        assert review.release_held(conn) == []
+
+
+def test_new_silent_postings_pass_and_refusals_are_still_rejected(engine):
+    ingest(engine, [posting("u"), posting("n", NO, title="Infra Engineer")])
+    with engine.begin() as conn:
+        result = run_filters(conn, SCORE_SILENT, needs_sponsorship=True)
+    assert result.passed_ids == [row(engine, "u").id]
+    assert row(engine, "n").filter_reason.startswith("visa:")
+    assert held(engine) == []
+    fake = type("J", (), dict(closed_at=None, status="MATCHED", choice=None, posted_at=NOW, description=UNKNOWN))
+    assert _eligible(fake, 3, False)                     # deliverable without explicit support
+
+
+def test_worker_releases_held_jobs_scores_them_and_tags_the_alert(engine, boards, llm, telegram):
+    server, tg = telegram
+    prefs = Preferences(interests=["backend"], needs_visa_sponsorship=True)
+    strict = SETTINGS.model_copy(update={"filters": POLICY, "preferences": prefs})
+    add_board(engine, "acme")
+    add_profile(engine)
+    boards.snapshots["acme"] = [posting("u")]
+    fake = llm(assessment(role_match=10, technical_match=10, experience_match=10))
+    w = make_worker(engine, boards, telegram=tg, settings=strict)
+    poll(w, engine)
+    w.filter_once()
+    assert [e.title for e in held(engine)] == ["Backend Engineer"] and tasks(engine, "match") == []
+
+    w.settings = SETTINGS.model_copy(update={"filters": SCORE_SILENT, "preferences": prefs})
+    boards.snapshots["acme"] = [posting("u"), posting("v", title="Platform Engineer")]
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE board_state SET next_due_at = now(), snapshot_hash = NULL"))
+    poll(w, engine)
+    assert [t.job_id for t in tasks(engine, "filter")] == [row(engine, "v").id]   # unchanged "u" isn't requeued
+    w.filter_once()                                      # the new job's batch also releases the held one
+    assert sorted(t.job_id for t in tasks(engine, "match")) == sorted([row(engine, "u").id, row(engine, "v").id])
+    w.match_once()
+    w.notify_once()
+    assert len(fake.calls) == 2 and len(server.sent) == 2
+    assert all("🛂 Sponsorship: not mentioned in the posting" in m["text"] for m in server.sent)

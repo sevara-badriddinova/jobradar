@@ -23,7 +23,9 @@ def test_one_message_for_browsing_liking_skipping_and_applying_across_restarts(e
     assert "why a" in server.edited[-1]["text"]
     assert any(b.get("url") for r in server.edited[-1]["reply_markup"]["inline_keyboard"] for b in r)
     click(engine, server, tg, f"q:like:{job_id}:new:0")
-    assert "Liked" in server.edited[-1]["text"]
+    # The choice is saved and the job leaves the detail view: back to New, without it.
+    assert "New · 1 job" in server.edited[-1]["text"] and "Engineer a" not in server.edited[-1]["text"]
+    assert server.deleted == []                        # the queue message itself is never deleted
     click(engine, server, tg, "q:list:liked:0")
     assert "Engineer a" in server.edited[-1]["text"]
     # Every call rereads persistent state; no process-local message cache.

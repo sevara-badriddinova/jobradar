@@ -18,13 +18,18 @@ from sqlalchemy.dialects.postgresql import insert
 
 from jobradar.collectors import COLLECTORS
 from jobradar.db import jobs, app_state
+from jobradar import geo
 from jobradar.dedup import normalize_key
-from jobradar.settings import FilterSettings
+from jobradar.queue import drop_tasks
+from jobradar.settings import TITLE_EXCLUDE_BEFORE_20261028, FilterSettings
 from jobradar.recency import discovered_recently, publication_reason, recent_jobs
 from jobradar.query_fields import location_raw
-from jobradar.sponsorship_review import UNKNOWN_REASON, hold, kept_fingerprints, resolve
+from jobradar.sponsorship_review import UNKNOWN_REASON, hold, kept_fingerprints, release_held, resolve
 
 log = logging.getLogger(__name__)
+
+# Reason for a pruned job (content emptied by prune.py) that the rules reach again.
+PRUNED_REASON = "content pruned: posting text no longer stored"
 
 # --- title ---------------------------------------------------------------------
 
@@ -193,24 +198,66 @@ _US_STATE_CODE = re.compile(r",\s*(" + "|".join(_US_STATES) + r")\b")  # "Austin
 _CA_PROVINCE_CODE = re.compile(r",\s*(ON|BC|QC|AB|MB|NS|NB|SK|NL|PE)\b")  # "Toronto, ON"
 
 
+_US_WORDS.add("new england")      # the US region, not England
+# Regions containing "america" that are not the US ("Remote - Latin America").
+_NOT_US_AMERICA = re.compile(r"\b(?:latin|south|central) america\b")
+_NON_US_WORDS |= {"latin america", "south america", "central america"} | geo.COUNTRIES | geo.CITIES
+_NON_US_PATTERN = re.compile(r"(?:^| )(?:" + "|".join(sorted(map(re.escape, _NON_US_WORDS), key=len, reverse=True))
+                             + r")(?: |$)")
+# Workday's structured prefix: "DEU - Saxony - Dresden", "IND - HR - NOIDA", "PHL Quezon City".
+_ISO3_PREFIX = re.compile(r"([A-Z]{3})(?:\s*[-,]\s*\S|\s+[A-Z]|\s*$)")
+# Labels that may include the US, so they never prove a job is abroad.
+_GENERIC_PLACE = re.compile(r"\b(?:remote|anywhere|hybrid|flexible|virtual|distributed|various|multiple|"
+                            r"locations?|wfh|work from home|home based|homebased|global|worldwide)\b")
+
+
+def _iso3(location: str) -> str | None:
+    match = _ISO3_PREFIX.match(location.strip())
+    return match[1] if match and match[1] in geo.ISO3 else None
+
+
 def _place(location: str) -> str:
-    """'us', 'non-us' or 'unknown' for one location string."""
+    """'us', 'non-us' or 'unknown' for one location string. Any US signal wins."""
     if re.fullmatch(r"[A-Z]{2}", location.strip()):  # ISO-2 country code (Lever)
         return "us" if location.strip() == "US" else "non-us"
     text = normalize_key(location)
-    if _US_STATE_CODE.search(location) or any(_has_phrase(text, w) for w in _US_WORDS):
+    us_text = _NOT_US_AMERICA.sub(" ", text)
+    if _US_STATE_CODE.search(location) or any(_has_phrase(us_text, w) for w in _US_WORDS):
         return "us"
-    if _CA_PROVINCE_CODE.search(location) or any(_has_phrase(text, w) for w in _NON_US_WORDS):
+    if code := _iso3(location):
+        return "us" if code in geo.US_ISO3 else "non-us"
+    if _CA_PROVINCE_CODE.search(location) or _NON_US_PATTERN.search(text):
         return "non-us"
     return "unknown"
 
 
+def _is_country(location: str) -> bool:
+    """A country-level field (name, ISO-2 or ISO-3 code), not just a city."""
+    stripped = location.strip()
+    return (bool(re.fullmatch(r"[A-Z]{2}", stripped)) or _iso3(stripped) is not None
+            or normalize_key(stripped) in geo.COUNTRIES)
+
+
 def location_reason(locations: list[str]) -> str | None:
-    """Reject only if every known location is outside the US; "Remote" alone passes."""
-    places = [_place(loc) for loc in locations]
-    if places and all(p == "non-us" for p in places):
-        return f"location: {locations[0]}"
-    return None
+    """Reject only when the job is clearly outside the US.
+
+    Any US location passes, and so does a generic label ("Remote", "Hybrid",
+    "2 Locations") that may include the US. Otherwise every location being
+    outside the US rejects, and so does a non-US *country* field next to place
+    names we cannot classify: Workday's "DEU - Saxony - Dresden" with country
+    "Germany", Workable's "Ha Noi" with "Vietnam"/"VN". A city we don't know next
+    to a foreign *city* ("Raleigh" + "London") still passes.
+    """
+    places = [(loc, _place(loc)) for loc in locations]
+    if not places or any(p == "us" for _, p in places):
+        return None
+    abroad = [loc for loc, p in places if p == "non-us"]
+    unknown = [loc for loc, p in places if p == "unknown"]
+    if not abroad or any(_GENERIC_PLACE.search(normalize_key(loc)) for loc in unknown):
+        return None
+    if unknown and not any(_is_country(loc) for loc in abroad):
+        return None
+    return f"location: {locations[0]}"
 
 
 # --- putting it together ----------------------------------------------------------
@@ -240,6 +287,43 @@ def reject_reason(*, source: str, title: str, location: str | None, description:
     return None
 
 
+def _signature(policy: dict, needs_sponsorship: bool, *, version: int) -> str:
+    return hashlib.sha256(json.dumps({"filters": policy, "needs_sponsorship": needs_sponsorship,
+                                      "version": version}, sort_keys=True).encode()).hexdigest()
+
+
+def _tightened_title_signatures(policy: dict, needs_sponsorship: bool) -> set[str]:
+    """Signatures of the same policy with an earlier, smaller default title
+    exclusion list, in its original order (the current list must extend it)."""
+    current = policy.get("title_must_exclude") or []
+    earlier = [list(TITLE_EXCLUDE_BEFORE_20261028)]
+    return {_signature({**policy, "title_must_exclude": old}, needs_sponsorship, version=6)
+            for old in earlier if old != current and set(old) <= set(current)}
+
+
+def recheck_titles(conn: Connection, settings: FilterSettings) -> tuple[int, Counter]:
+    """Apply the title rules to open jobs that are not filtered (passed, matched
+    but unsent, reposted) and reject the ones that now fail. Their queued AI
+    tasks are dropped. Uses the (status, first_seen_at) index; no heap scan."""
+    rows = conn.execute(select(jobs.c.id, jobs.c.title).where(
+        jobs.c.closed_at.is_(None), jobs.c.status.in_(["DISCOVERED", "REPOSTED", "MATCHED"]))).all()
+    decisions: dict[str, list[int]] = {}
+    for row in rows:
+        reason = title_reason(row.title, settings)
+        if reason:
+            decisions.setdefault(reason, []).append(row.id)
+    rejected = Counter()
+    for reason, ids in decisions.items():
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            conn.execute(update(jobs).where(jobs.c.id.in_(chunk)).values(
+                status="FILTERED", filter_reason=reason, filtered_at=func.now()))
+            resolve(conn, chunk, reason)
+            drop_tasks(conn, "match", chunk)
+        rejected[reason] += len(ids)
+    return len(rows), rejected
+
+
 @dataclass
 class FilterResult:
     passed: int = 0
@@ -262,12 +346,38 @@ def run_filters(conn: Connection, settings: FilterSettings, *, recheck: bool = F
     # postings first seen in the last 72 h, which migration 0014 re-queues, and
     # a full recheck (several heap scans of jobs, one transaction) is not worth
     # that on the VM's disk. Including it (even unset) would force one on deploy.
-    policy = settings.model_dump(exclude={"max_discovery_age_days"})
-    signature = hashlib.sha256(json.dumps({"filters": policy,
-        "needs_sponsorship": needs_sponsorship, "version": 5}, sort_keys=True).encode()).hexdigest()
+    # require_explicit_sponsorship is left out too: it only decides whether a
+    # posting that is silent about sponsorship is held for review or scored.
+    # Turning it off releases exactly the held rows (below); turning it on holds
+    # new postings and send-time eligibility blocks unsent silent ones. Neither
+    # needs a full recheck.
+    policy = settings.model_dump(exclude={"max_discovery_age_days", "require_explicit_sponsorship"})
+    signature = _signature(policy, needs_sponsorship, version=6)
     previous = conn.execute(select(app_state.c.value).where(app_state.c.key == "filter_context")).scalar_one_or_none()
-    recheck = recheck or previous != signature
+    # Version 5 signatures included require_explicit_sponsorship. Accept either
+    # value of it, so this upgrade alone does not force a full recheck.
+    legacy = {_signature({**policy, "require_explicit_sponsorship": value}, needs_sponsorship, version=5)
+              for value in (True, False)}
+    # Title exclusions were only added since the stored signature: that can only
+    # reject more jobs, so re-checking titles of the jobs not filtered yet is
+    # enough. A full recheck (heap scans, row locks held for minutes on the VM)
+    # is reserved for real policy changes.
+    titles_tightened = (not recheck and previous is not None and previous != signature
+                        and previous not in legacy
+                        and previous in _tightened_title_signatures(policy, needs_sponsorship))
+    recheck = recheck or (previous != signature and previous not in legacy and not titles_tightened)
     result = FilterResult()
+    if titles_tightened:
+        checked, rejected = recheck_titles(conn, settings)
+        result.rejected.update(rejected)
+        log.info("filters: title exclusions added; %d unfiltered open job(s) rechecked by title, "
+                 "%d now rejected", checked, rejected.total())
+    if not settings.require_explicit_sponsorship:
+        released = release_held(conn)
+        if released:
+            log.info("filters: %d job(s) held for a sponsorship review released for scoring", len(released))
+            if only_ids is not None:
+                only_ids = [*only_ids, *released]
     statuses = ["DISCOVERED", "REPOSTED", "FILTERED", "MATCHED"]
     if settings.max_posting_age_days is not None:
         statuses.append("NOTIFIED")
@@ -350,10 +460,14 @@ def run_filters(conn: Connection, settings: FilterSettings, *, recheck: bool = F
         if body_ids:
             query = select(jobs.c.id, jobs.c.source, jobs.c.title, jobs.c.location, jobs.c.fingerprint,
                            jobs.c.description, location_raw(), jobs.c.posted_at, jobs.c.first_seen_at,
-                           jobs.c.discovered_in_backfill).where(jobs.c.id.in_(body_ids))
+                           jobs.c.discovered_in_backfill, jobs.c.raw_digest).where(jobs.c.id.in_(body_ids))
             held = []
             for row in conn.execute(query):
-                reason = reject_reason(source=row.source, title=row.title, location=row.location,
+                # A pruned job has no text to judge. Pruning only takes jobs no
+                # posting-date rule can accept, so this is reached only if the
+                # rules were widened later; never pass such a job to the AI.
+                reason = PRUNED_REASON if row.raw_digest is not None else reject_reason(
+                    source=row.source, title=row.title, location=row.location,
                     description=row.description, raw=row.raw, settings=settings,
                     needs_sponsorship=needs_sponsorship, posted_at=row.posted_at,
                     first_seen_at=row.first_seen_at, backfill=row.discovered_in_backfill)

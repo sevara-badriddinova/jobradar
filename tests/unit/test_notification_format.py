@@ -81,3 +81,16 @@ def test_empty_digest_sends_nothing():
 def test_threshold_order_is_validated():
     with pytest.raises(ValueError, match="digest_min_score"):
         NotificationSettings(immediate_min_score=60, digest_min_score=70)
+
+
+def test_sponsorship_line_quotes_support_or_says_it_is_not_mentioned():
+    silent = job(description="Build backend services in Go.")
+    assert "Sponsorship" not in job_message(silent, NOW)              # the user doesn't need it
+    assert "🛂 Sponsorship: not mentioned in the posting" in job_message(silent, NOW, needs_sponsorship=True)
+    offers = job(description="We sponsor H-1B visas for this role.")
+    text = job_message(offers, NOW, needs_sponsorship=True)
+    assert "🛂 Posting says: We sponsor H-1B visas for this role." in text and "not mentioned" not in text
+    [(digest, _)] = digest_messages([(1, silent)], needs_sponsorship=True)
+    assert "🛂 Sponsorship not mentioned" in digest
+    [(digest, _)] = digest_messages([(1, silent)])
+    assert "Sponsorship" not in digest

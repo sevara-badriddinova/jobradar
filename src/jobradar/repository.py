@@ -11,7 +11,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from sqlalchemy import Text, case, column, exists, func, literal, or_, select, text, update, values
+from sqlalchemy import Text, case, cast, column, exists, func, literal, or_, select, text, update, values
 from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.engine import Connection
 
@@ -86,6 +86,23 @@ def _stable(raw, source: str):
     for key in VOLATILE_RAW_KEYS.get(source, ()):
         raw = raw.op("-")(literal(key, Text))
     return raw
+
+
+def raw_digest(raw, source: str):
+    """MD5 of the payload as ingestion compares it (jsonb text is canonical).
+    Stored on pruned rows, whose raw payload is emptied (see prune.py)."""
+    return func.md5(cast(_stable(raw, source), Text))
+
+
+def _raw_changed(payload, source: str):
+    # A pruned row keeps only the digest of its payload; every other row is
+    # compared as JSONB, exactly as before pruning existed.
+    return case((jobs_t.c.raw_digest.is_(None), _stable(jobs_t.c.raw, source).is_distinct_from(_stable(payload, source))),
+                else_=jobs_t.c.raw_digest.is_distinct_from(raw_digest(payload, source)))
+
+
+def _pruned():
+    return jobs_t.c.raw_digest.is_not(None)
 
 
 SNAPSHOT_DIGEST_VERSION = 1
@@ -166,8 +183,8 @@ def ingest_snapshot(
         rows = conn.execute(select(
             jobs_t.c.id, jobs_t.c.source_job_id, jobs_t.c.title, jobs_t.c.location,
             jobs_t.c.url, jobs_t.c.description_hash, jobs_t.c.closed_at, jobs_t.c.posted_at,
-            _stable(jobs_t.c.raw, source).is_distinct_from(_stable(incoming.c.payload, source))
-            .label("raw_changed"), jobs_t.c.company
+            _raw_changed(incoming.c.payload, source).label("raw_changed"), jobs_t.c.company,
+            _pruned().label("pruned")
         ).join(incoming, jobs_t.c.source_job_id == incoming.c.sid).where(jobs_t.c.source == source))
         existing.update((r.source_job_id, r) for r in rows)
     result.seen = len(existing)
@@ -202,17 +219,23 @@ def ingest_snapshot(
                 update(jobs_t).where(jobs_t.c.id == row.id).values(
                     company=job.company, title=job.title, location=job.location, url=job.url,
                     description=job.description, posted_at=job.posted_at,
-                    raw=job.raw, content_changed_at=func.now(), **d,
+                    raw=job.raw, raw_digest=None, content_changed_at=func.now(), **d,
                 )
             )
             result.changed += 1
         elif row.posted_at != job.posted_at:
             # Sources can add/correct publication dates without changing the text.
+            # A pruned row gets its content back: it is about to be filtered again.
+            restore = {"description": job.description, "raw_digest": None} if row.pruned else {}
             conn.execute(update(jobs_t).where(jobs_t.c.id == row.id)
-                         .values(posted_at=job.posted_at, raw=job.raw,
+                         .values(posted_at=job.posted_at, raw=job.raw, **restore,
                                  filtered_at=case((jobs_t.c.status.in_([
                                      "DISCOVERED", "REPOSTED", "FILTERED", "MATCHED", "NOTIFIED"
                                  ]), None), else_=jobs_t.c.filtered_at)))
+        elif row.pruned and row.closed_at is not None:
+            # Reopened unchanged: it is filtered again, so it needs its content.
+            conn.execute(update(jobs_t).where(jobs_t.c.id == row.id).values(
+                description=job.description, raw=job.raw, raw_digest=None))
 
     # --- Unknown IDs: levels 2 and 3, then insert ---------------------------
     # A board with no open postings yet is on its initial scan: everything it

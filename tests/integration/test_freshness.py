@@ -227,7 +227,8 @@ def test_migration_0014_requeues_only_recent_too_old_rejections(scratch, monkeyp
     from alembic import command
     from alembic.config import Config
     from jobradar.db import migrate
-    monkeypatch.setattr("jobradar.repository._is_initial_scan", lambda *a: False)
+    from tests.integration.helpers import ingest_with_an_older_schema
+    ingest_with_an_older_schema(monkeypatch)
     config = Config()
     config.set_main_option("script_location", "jobradar:migrations")
     with scratch.connect() as conn:

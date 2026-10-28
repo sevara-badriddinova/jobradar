@@ -157,3 +157,9 @@ def test_wrong_token(server):
     tg = Telegram("bad-token", server.client())
     with pytest.raises(TelegramError, match="Unauthorized"):
         tg.get_me()
+
+
+def test_delete_message(server):
+    tg = Telegram(server.token, server.client())
+    tg.delete_message(42, 7)
+    assert server.deleted == [7] and server.calls[-1] == ("deleteMessage", {"chat_id": 42, "message_id": 7})

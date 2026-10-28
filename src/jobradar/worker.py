@@ -478,7 +478,8 @@ class Worker:
             return queued
         policy = dict(max_posting_age_days=settings.filters.max_posting_age_days,
                       discovery_days=settings.filters.max_discovery_age_days,
-                      require_explicit_sponsorship=settings.filters.require_explicit_sponsorship)
+                      require_explicit_sponsorship=settings.filters.require_explicit_sponsorship,
+                      needs_sponsorship=self.needs_sponsorship)
         sent = send_immediate(self.engine, tg, chat_id, **policy)
         total, failed = sent.sent, sent.failed
         if digest:

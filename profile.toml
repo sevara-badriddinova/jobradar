@@ -10,7 +10,10 @@ max_years_required = 2   # reject when a job's *minimum* required experience is 
 max_posting_age_days = 3 # known publication date within the last 72 hours
 max_discovery_age_days = 14 # also: first seen by JobRadar in the last 72 h, published within 14 days,
                             # and not from a newly added board's initial scan
-require_explicit_sponsorship = true # explicit support -> AI; refusal -> rejected; not stated -> sponsorship review queue
+require_explicit_sponsorship = false # explicit refusal -> always rejected. false: postings silent about
+                                     # sponsorship are AI-scored; alerts say "Sponsorship: not mentioned".
+                                     # true: only explicit support is scored; silent postings wait in
+                                     # `jobradar sponsorship-review` (server only, nothing is sent)
 
 # Titles must contain at least one of these words/phrases. Uncomment to replace the default list:
 # title_must_include = ["engineer", "engineering", "developer", "software", "swe", "sde",
@@ -25,6 +28,9 @@ require_explicit_sponsorship = true # explicit support -> AI; refusal -> rejecte
 #     "qa", "quality assurance", "test engineer", "sdet", "sales engineer", "solutions engineer",
 #     "support engineer", "customer engineer", "field engineer", "mechanical", "electrical",
 #     "civil", "hardware", "manufacturing", "aerodynamics", "aerostructures", "recruiter",
+#     # added Oct 28 (see TITLE_EXCLUDE_ADDED_20261028 in src/jobradar/settings.py):
+#     "field service", "quality engineer", "process engineer", "controls engineer", "plant",
+#     "technician", "asic", "fpga", "rf", "construction", "structural", ... (47 phrases)
 # ]
 
 [preferences]

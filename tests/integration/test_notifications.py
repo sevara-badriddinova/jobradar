@@ -5,6 +5,7 @@ from sqlalchemy import func, select, update
 from jobradar import cli
 from jobradar.db import app_state, feedback, job_matches, jobs as jobs_t, notifications
 from jobradar.notifications import (
+    refresh_buttons,
     MAX_ATTEMPTS, MAX_FAILURES_IN_A_ROW, enqueue, process_updates, resend_stuck, send_digest, send_immediate,
 )
 from jobradar.settings import NotificationSettings, Settings
@@ -186,10 +187,36 @@ class TestButtons:
         with engine.connect() as conn:
             assert conn.execute(select(feedback.c.kind, feedback.c.source)).all() == [("APPLIED", "telegram")]
         methods = [m for m, _ in server.calls]
-        assert "answerCallbackQuery" in methods and "editMessageReplyMarkup" in methods
-        edited = [p for m, p in server.calls if m == "editMessageReplyMarkup"][0]
-        assert edited["reply_markup"]["inline_keyboard"][1][0]["text"] == "✅ Marked as applied"
-        assert edited["reply_markup"]["inline_keyboard"][1][1]["callback_data"] == f"ignored:{job_id}"
+        assert "answerCallbackQuery" in methods and "editMessageReplyMarkup" not in methods
+        assert server.deleted == [100]                   # the decided card leaves the chat
+
+    @pytest.mark.parametrize("action,choice", [("ignored", "IGNORED"), ("queue", "QUEUED"),
+                                               ("sponsorship", "SPONSORSHIP"), ("applied", "APPLIED")])
+    def test_every_choice_removes_the_alert_card(self, engine, server, tg, action, choice):
+        from jobradar.db import job_reviews
+        matched(engine, {"a": 92})
+        queue(engine)
+        send_immediate(engine, tg, CHAT)
+        card = server.sent[0]["message_id"]
+        server.press(f"{action}:{row(engine, 'a').id}", chat_id=CHAT, message_id=card)
+        assert process_updates(engine, tg, CHAT) == 1
+        assert server.deleted == [card]
+        with engine.connect() as conn:
+            assert conn.execute(select(job_reviews.c.choice)).scalar_one() == choice
+            assert conn.execute(select(notifications.c.message_id)).scalar_one() is None
+
+    def test_a_card_too_old_to_delete_collapses_to_one_line(self, engine, server, tg):
+        matched(engine, {"a": 92})
+        queue(engine)
+        send_immediate(engine, tg, CHAT)
+        card = server.sent[0]["message_id"]
+        server.fail("deleteMessage", (400, {"ok": False, "description": "Bad Request: message can't be deleted"}))
+        server.press(f"ignored:{row(engine, 'a').id}", chat_id=CHAT, message_id=card)
+        assert process_updates(engine, tg, CHAT) == 1
+        [collapsed] = [e for e in server.edited if e["message_id"] == card]
+        assert collapsed["text"].startswith("👎 Not interested · ") and "Engineer a" in collapsed["text"]
+        assert collapsed["reply_markup"] == {"inline_keyboard": []}
+        assert refresh_buttons(engine, tg, CHAT) == 0    # never restores buttons on it
 
     def test_each_update_is_processed_once(self, engine, server, tg):
         matched(engine, {"a": 92})

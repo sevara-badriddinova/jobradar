@@ -72,6 +72,10 @@ jobs = Table(
     # employer's publication date can make it fresh. See recency.py.
     Column("discovered_in_backfill", Boolean, nullable=False, server_default=text("false")),
     Column("raw", JSONB, nullable=False),
+    # Set only on pruned jobs (description and raw emptied, see prune.py): MD5 of
+    # the raw payload as ingestion compares it, so an unchanged posting stays
+    # unchanged. NULL means the row has its full content.
+    Column("raw_digest", Text),
     # Level-1 dedup + idempotency: the database, not application code,
     # guarantees one row per source posting even under retries/races.
     UniqueConstraint("source", "source_job_id", name="uq_jobs_source_job"),

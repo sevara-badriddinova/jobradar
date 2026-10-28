@@ -57,6 +57,27 @@ def resolve(conn: Connection, job_ids: list[int], resolution: str) -> int:
         .values(state="resolved", resolution=resolution[:200], decided_at=func.now())).rowcount
 
 
+def release_held(conn: Connection) -> list[int]:
+    """require_explicit_sponsorship was turned off: every pending entry's open,
+    still-held job goes back to the filters (and from there to AI scoring).
+
+    Entries are resolved, not deleted; if the setting is turned on again, a
+    re-held role reopens its entry and earlier keep/dismiss decisions stand.
+    Cheap: it reads only pending entries, so it is a no-op once released."""
+    job_ids = conn.execute(update(sponsorship_reviews).where(sponsorship_reviews.c.state == "pending")
+        .values(state="resolved", resolution="released: explicit sponsorship no longer required",
+                decided_at=func.now())
+        .returning(sponsorship_reviews.c.job_id)).scalars().all()
+    job_ids = sorted({i for i in job_ids if i is not None})
+    released = []
+    for start in range(0, len(job_ids), 500):
+        released += conn.execute(update(jobs).where(
+            jobs.c.id.in_(job_ids[start:start + 500]), jobs.c.status == "FILTERED",
+            jobs.c.filter_reason == UNKNOWN_REASON, jobs.c.closed_at.is_(None))
+            .values(filtered_at=None).returning(jobs.c.id)).scalars().all()
+    return sorted(released)
+
+
 def kept_fingerprints(conn: Connection, fingerprints) -> set[str]:
     fingerprints = [f for f in set(fingerprints) if f]
     if not fingerprints:

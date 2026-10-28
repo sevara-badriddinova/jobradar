@@ -150,7 +150,7 @@ def backup():
         with os.fdopen(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as stream:
             subprocess.run(["docker", "compose", "exec", "-T", "postgres", "pg_dump",
                             "-U", "jobradar", "-d", "jobradar", "-Fc", "-Z1",
-                            "--lock-wait-timeout=30s"], cwd=ROOT, stdout=stream, check=True, timeout=2700)
+                            "--lock-wait-timeout=30s"], cwd=ROOT, stdout=stream, check=True, timeout=5400)
             stream.flush()
             os.fsync(stream.fileno())
         progress(f"Dump finished: {partial.stat().st_size} bytes in {time.monotonic()-started:.1f}s")

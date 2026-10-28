@@ -337,6 +337,44 @@ def deliver_queue_mode(engine, tg, chat_id, profile_settings) -> int:
     return queued["immediate"] + queued["digest"]
 
 
+def cmd_prune_content(args) -> int:
+    """Empty the stored text of jobs that can never qualify again (see prune.py)."""
+    from sqlalchemy import text as sql
+    from jobradar.prune import DETAIL_SOURCES, prune_content
+    from jobradar.sponsorship_review import UNKNOWN_REASON
+    engine = make_engine()
+    if not args.yes:
+        # A large table is estimated from a 1% block sample (no full scan).
+        with engine.connect() as conn:
+            total = conn.execute(sql("SELECT reltuples FROM pg_class WHERE relname = 'jobs'")).scalar() or 0
+            sample = "TABLESAMPLE SYSTEM (1)" if total > 200_000 else ""
+            row = conn.execute(sql(f"""
+                SELECT count(*) AS sampled,
+                  count(*) FILTER (WHERE ok) AS prunable,
+                  coalesce(sum(pg_column_size(raw) + pg_column_size(description)) FILTER (WHERE ok), 0) AS bytes
+                FROM (SELECT j.*, (raw_digest IS NULL AND status IN ('FILTERED', 'DUPLICATE')
+                        AND filter_reason IS DISTINCT FROM :held
+                        AND first_seen_at < now() - make_interval(days => :seen)
+                        AND (posted_at IS NULL OR posted_at < now() - make_interval(days => :posted))
+                        AND (closed_at IS NOT NULL OR source <> ALL(:detail))) AS ok
+                      FROM jobs j {sample}) s
+            """), {"held": UNKNOWN_REASON, "seen": args.min_age_days, "posted": args.posted_before_days,
+                   "detail": list(DETAIL_SOURCES)}).one()
+        if not row.sampled:
+            print("no jobs stored")
+            return 0
+        total = total if sample else row.sampled
+        share = row.prunable / row.sampled
+        print(f"estimate{' (1% sample)' if sample else ''}: {share:.0%} of ~{int(total):,} jobs prunable, "
+              f"~{row.bytes / row.sampled * total / 2**20:,.1f} MB of stored text and payload")
+        print("run again with --yes to prune")
+        return 0
+    result = prune_content(engine, min_age_days=args.min_age_days, posted_before_days=args.posted_before_days,
+                           batch=args.batch, limit=args.limit, pause=args.pause, start_after=args.start_after)
+    print(f"pruned {result.pruned} jobs in {result.batches} batches (through id {result.last_id})")
+    return 0
+
+
 def cmd_sponsorship_review(args) -> int:
     """The held-for-review queue: roles that neither offer nor refuse sponsorship."""
     from jobradar import queue as work
@@ -398,7 +436,8 @@ def cmd_notify(args) -> int:
             return 0
         policy = dict(max_posting_age_days=max_age,
                       discovery_days=profile_settings.filters.max_discovery_age_days,
-                      require_explicit_sponsorship=profile_settings.filters.require_explicit_sponsorship)
+                      require_explicit_sponsorship=profile_settings.filters.require_explicit_sponsorship,
+                      needs_sponsorship=profile_settings.preferences.needs_visa_sponsorship is True)
         sent = send_immediate(engine, tg, chat_id, **policy)
         digest = send_digest(engine, tg, chat_id, **policy) if args.digest else None
 
@@ -841,6 +880,18 @@ def main(argv: list[str] | None = None) -> int:
                    help="keep: AI-score this role and alert on a good match")
     p.add_argument("--dismiss", type=int, nargs="+", metavar="ID", help="dismiss (stays dismissed if reposted)")
     p.set_defaults(func=cmd_sponsorship_review)
+
+    p = sub.add_parser("prune-content",
+                       help="empty the stored text of filtered jobs that can never qualify again")
+    p.add_argument("--yes", action="store_true", help="prune (without it: print a sampled estimate)")
+    p.add_argument("--min-age-days", type=positive_int, default=3, help="first seen at least this long ago")
+    p.add_argument("--posted-before-days", type=positive_int, default=14,
+                   help="undated, or published at least this long ago")
+    p.add_argument("--batch", type=positive_int, default=2000, help="rows per transaction")
+    p.add_argument("--limit", type=positive_int, help="stop after this many rows")
+    p.add_argument("--pause", type=float, default=0.0, help="seconds to sleep between batches")
+    p.add_argument("--start-after", type=int, default=0, help="resume after this job id")
+    p.set_defaults(func=cmd_prune_content)
 
     p = sub.add_parser("notify", help="send Telegram alerts for new matches and apply button presses")
     p.add_argument("--digest", action="store_true", help="also send the digest of lower-scoring matches")

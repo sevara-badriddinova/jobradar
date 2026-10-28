@@ -171,6 +171,17 @@ def release(conn: Connection, tasks: list[Task], owner: str, *, delay: float = 0
     """), {"ids": [t.id for t in tasks], "owner": owner, "delay": float(delay)}).rowcount
 
 
+def drop_tasks(conn: Connection, kind: str, job_ids: list[int]) -> int:
+    """Delete waiting tasks of these jobs (they no longer need the work).
+    Leased tasks are left to their worker, whose handler skips an ineligible job."""
+    if not job_ids:
+        return 0
+    return conn.execute(text("""
+        DELETE FROM work_queue
+        WHERE kind = :kind AND job_id = ANY(CAST(:ids AS bigint[])) AND state <> 'leased'
+    """), {"kind": kind, "ids": list(job_ids)}).rowcount
+
+
 def release_owner(conn: Connection, owner: str) -> int:
     """Return everything an exiting worker still holds, including board leases."""
     tasks = conn.execute(text("""

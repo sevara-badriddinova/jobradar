@@ -11,6 +11,7 @@ class FakeTelegram:
         self.token = token
         self.sent: list[dict[str, Any]] = []          # sendMessage payloads, in order
         self.edited: list[dict[str, Any]] = []
+        self.deleted: list[int] = []                  # deleteMessage message ids
         self.calls: list[tuple[str, dict]] = []       # (method, payload) for every request
         self.updates: list[dict[str, Any]] = []
         self.failures: dict[str, list[Any]] = {}      # method -> queued failures
@@ -73,6 +74,10 @@ class FakeTelegram:
         return True
 
     def _editMessageReplyMarkup(self, payload):
+        return True
+
+    def _deleteMessage(self, payload):
+        self.deleted.append(payload["message_id"])
         return True
 
     def _editMessageText(self, payload):
