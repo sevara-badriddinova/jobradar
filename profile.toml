@@ -47,8 +47,8 @@ delivery = "alerts"             # send new Telegram messages for qualifying matc
 # Matches at or above immediate_min_score are sent to Telegram right away (`jobradar notify`).
 # Matches between digest_min_score and immediate_min_score wait for `jobradar notify --digest`.
 # Below digest_min_score they're only stored (see them with `jobradar top --min-score 0`).
-immediate_min_score = 80
-digest_min_score = 70
+immediate_min_score = 90       # Oct 29: alert only on 90+ matches
+digest_min_score = 90          # equal to immediate: no digest of lower scores
 
 # Job Applications tracker: column names and statuses verified in its browser view.
 # Credentials and tracker ID belong in .env; see docs/11-notion.md.

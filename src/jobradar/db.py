@@ -276,6 +276,9 @@ board_state = Table(
     # Digest of the last fully ingested snapshot (unchanged polls skip ingestion).
     Column("snapshot_hash", Text),
     Column("snapshot_at", TS),
+    # Last time one of this board's postings passed the filters: such boards
+    # are revisited more often (worker.relevant_interval).
+    Column("relevant_at", TS),
     Index("ix_board_state_due", "next_due_at"),
 )
 
@@ -297,6 +300,8 @@ work_queue = Table(
     Column("lease_owner", Text),
     Column("lease_until", TS),
     Column("last_error", Text),
+    # match tasks: the job's publication date when queued; newest day first.
+    Column("rank_at", TS),
     UniqueConstraint("kind", "job_id", name="uq_work_queue_kind_job"),
     CheckConstraint("kind IN ('filter','match')", name="ck_work_queue_kind"),
     CheckConstraint("state IN ('ready','leased','dead')", name="ck_work_queue_state"),

@@ -83,6 +83,15 @@ class WorkerConfig:
     max_match_backlog: int | None = None   # matching never blocks discovery by default
     match_concurrency: int = 2
     ai_daily_budget_usd: float | None = None  # None: record spend, never pause
+    ai_budget_paced: bool = False          # grow the cap hourly through the UTC day (ai_budget.py)
+    # Boards whose postings passed the filters in the last `relevant_days` are
+    # revisited every `relevant_interval` (per-provider override), and half the
+    # collection slots go to the most overdue of them first; the other half keep
+    # the age order, so other boards are never starved. Workday polls take ~24 s
+    # (vs ~2 s elsewhere), so its relevant boards get 2 h to leave room for the rest.
+    relevant_days: int = 14
+    relevant_interval: float = 3600.0
+    relevant_interval_by_provider: dict[str, float] = field(default_factory=lambda: {"workday": 7200.0})
     digest_interval: float = 900.0
     idle_sleep: float = 5.0
     maintenance_interval: float = 30.0
@@ -116,7 +125,7 @@ class Worker:
         self.http = http_client or make_client()
         self.http.event_hooks.setdefault("request", []).append(self.limiter.hook)
         self.budget = ByteBudget(config.byte_budget)
-        self.meter = DailyBudgetMeter(engine, config.ai_daily_budget_usd)
+        self.meter = DailyBudgetMeter(engine, config.ai_daily_budget_usd, paced=config.ai_budget_paced)
         llm.set_meter(self.meter)
         self._budget_recheck = 0.0
         self.profile_path = profile_path
@@ -137,6 +146,7 @@ class Worker:
         self._notify_fail_streak = 0
         self._backlog = (0, 0, 0.0)                   # filter, match, measured at
         self._due_cache: tuple[dict[str, tuple[int, float]], float] = ({}, -1e18)
+        self._relevant_due: dict[str, float] = {}   # provider -> most overdue relevant board (epoch)
         self._claim_seq = 0                    # fair-claim rotation state
         self._last_served: dict[str, int] = {}
 
@@ -170,6 +180,9 @@ class Worker:
     def provider_limit(self, provider: str) -> int:
         return self.cfg.provider_concurrency.get(provider, self.cfg.default_provider_concurrency)
 
+    def relevant_interval(self, provider: str) -> float:
+        return self.cfg.relevant_interval_by_provider.get(provider, self.cfg.relevant_interval)
+
     def claim_boards(self, free: int) -> list[q.Board]:
         """Claim up to `free` overdue boards, round-robin across providers that
         still have capacity, most overdue first within each provider."""
@@ -181,18 +194,21 @@ class Worker:
         due, at = self._due_cache
         fresh = time.monotonic() - at > self.cfg.due_cache_seconds
         if fresh:
-            with self.engine.begin() as conn:
-                due = q.due_overview(conn)
-            self._due_cache = (due, time.monotonic())
+            due = self._refresh_due()
         claimed = self._claim_from(due, free)
         if not claimed and not fresh and self._spare_capacity(due):
             # Nothing came from the cached providers although slots are free:
             # the cached view may be stale (e.g. other providers became due).
-            with self.engine.begin() as conn:
-                due = q.due_overview(conn)
-            self._due_cache = (due, time.monotonic())
+            due = self._refresh_due()
             claimed = self._claim_from(due, free)
         return claimed
+
+    def _refresh_due(self) -> dict[str, tuple[int, float]]:
+        with self.engine.begin() as conn:
+            due = q.due_overview(conn)
+            self._relevant_due = q.due_relevant(conn, self.cfg.relevant_days)
+        self._due_cache = (due, time.monotonic())
+        return due
 
     def _spare_capacity(self, due: dict) -> bool:
         """True unless every cached due provider is already at its concurrency cap."""
@@ -204,9 +220,11 @@ class Worker:
         Even slots rotate: they go to the due provider served least recently,
         so every provider with due boards is polled within one rotation
         (providers / 2 slots... claims) however large the other backlogs are.
-        Odd slots go to the provider holding the most overdue board, which
-        keeps big providers served in proportion to their backlog. The old
-        "largest backlog takes every slot" rule starved small providers.
+        Odd slots go first to the provider holding the most overdue relevant
+        board (one whose postings recently passed the filters), and take that
+        board; with none due, to the provider holding the most overdue board,
+        which keeps big providers served in proportion to their backlog. The
+        old "largest backlog takes every slot" rule starved small providers.
         """
         claimed: list[q.Board] = []
         exhausted: set[str] = set()
@@ -215,8 +233,12 @@ class Worker:
                      and self._inflight[p] < self.provider_limit(p)]
             if not open_:
                 break
+            relevant = [p for p in open_ if p in self._relevant_due]
+            prefer = self._claim_seq % 2 == 1 and bool(relevant)
             if self._claim_seq % 2 == 0:
                 provider = min(open_, key=lambda p: (self._last_served.get(p, -1), due[p][0], due[p][1], p))
+            elif prefer:
+                provider = min(relevant, key=lambda p: (self._relevant_due[p], self._last_served.get(p, -1), p))
             else:
                 # Overdue age is capped at one priority-3 revisit: providers whose
                 # boards are all that late (e.g. thousands of never-polled boards
@@ -225,7 +247,10 @@ class Worker:
                 floor = time.time() - 3 * self.cfg.base_interval
                 provider = min(open_, key=lambda p: (max(due[p][1], floor), self._last_served.get(p, -1), p))
             with self.engine.begin() as conn:
-                boards = q.claim_boards(conn, provider, self.owner, 1, self.cfg.board_lease)
+                boards = q.claim_boards(conn, provider, self.owner, 1, self.cfg.board_lease,
+                                        prefer_relevant=prefer, relevant_days=self.cfg.relevant_days)
+            if prefer and not any(b.relevant for b in boards):
+                self._relevant_due.pop(provider, None)   # the cached view was stale
             if not boards:
                 exhausted.add(provider)
                 continue
@@ -286,7 +311,8 @@ class Worker:
                     kept = q.finish_board(conn, board, self.owner, ok=report.ok, error=report.error,
                                           fetched=report.fetched, nbytes=nbytes,
                                           base_interval=self.cfg.base_interval,
-                                          snapshot_hash=report.snapshot_hash)
+                                          snapshot_hash=report.snapshot_hash,
+                                          relevant_interval=self.relevant_interval(board.collector))
                     outcome = "ok" if report.ok else "failed"
             if not kept:
                 outcome = "lost"
@@ -362,6 +388,7 @@ class Worker:
                                  only_ids=[t.job_id for t in tasks])
             origin = {t.job_id: t.origin_at for t in tasks}
             passed = result.passed_ids
+            q.mark_relevant(conn, passed)
             for origin_at in sorted({origin.get(i) for i in passed}, key=lambda x: (x is None, x)):
                 ids = [i for i in passed if origin.get(i) == origin_at]
                 q.enqueue(conn, "match", ids, origin_at=origin_at, max_attempts=self.cfg.match_max_attempts)
@@ -389,8 +416,13 @@ class Worker:
         if self.meter.exhausted():
             self._budget_recheck = time.monotonic() + 300
             self.count("match_budget_pauses")
-            log.warning("daily AI budget of $%.2f reached; matching paused, tasks kept queued",
-                        self.cfg.ai_daily_budget_usd)
+            allowed = self.meter.allowance()
+            if allowed < self.cfg.ai_daily_budget_usd:
+                log.info("AI budget for this hour ($%.2f of $%.2f a day) reached; matching resumes "
+                         "next hour, tasks kept queued", allowed, self.cfg.ai_daily_budget_usd)
+            else:
+                log.warning("daily AI budget of $%.2f reached; matching paused, tasks kept queued",
+                            self.cfg.ai_daily_budget_usd)
             return True
         return False
 
@@ -606,7 +638,8 @@ class Worker:
             data = snapshot(conn)
         with self._lock:
             data["ai"] = {"spent_today_usd": round(self.meter.spent(), 4),
-                          "daily_budget_usd": self.cfg.ai_daily_budget_usd}
+                          "daily_budget_usd": self.cfg.ai_daily_budget_usd,
+                          "allowed_so_far_usd": self.meter.allowance()}
             data["worker"] = dict(self.counters, owner=self.owner, byte_budget_peak=self.budget.peak,
                                   rate_limit_wait_seconds=round(self.limiter.waited, 1))
         log.info("metrics %s", json.dumps(data, default=str, sort_keys=True))

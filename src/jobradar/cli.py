@@ -676,12 +676,12 @@ def cmd_worker(args) -> int:
         if env is None:
             return 2
         telegram = (Telegram(env[0], make_client()), env[1])
-    from jobradar.ai_budget import budget_from_env
+    from jobradar.ai_budget import budget_from_env, pacing_from_env
     budget = args.ai_daily_budget_usd if args.ai_daily_budget_usd is not None else budget_from_env()
     config = WorkerConfig(roles=roles, collect_concurrency=args.collect_concurrency,
                           base_interval=args.base_interval_minutes * 60,
                           byte_budget=args.byte_budget_mb * 1024 * 1024,
-                          ai_daily_budget_usd=budget)
+                          ai_daily_budget_usd=budget, ai_budget_paced=pacing_from_env())
     pool = config.collect_concurrency + 4
     engine = make_engine(pool_size=pool, max_overflow=2, pool_timeout=60)
 

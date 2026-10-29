@@ -48,6 +48,9 @@ def enqueue(conn: Connection, kind: str, job_ids, *, origin_at: datetime | None 
     origin win) and its generation is bumped so an in-flight run repeats. A dead
     task is revived with a fresh attempt budget: enqueueing is an explicit
     request that the job be processed again.
+
+    Match tasks record the job's publication date (rank_at): matching takes the
+    newest publication day first (see claim).
     """
     if kind not in KINDS:
         raise ValueError(kind)
@@ -55,11 +58,13 @@ def enqueue(conn: Connection, kind: str, job_ids, *, origin_at: datetime | None 
     if not ids:
         return 0
     return conn.execute(text("""
-        INSERT INTO work_queue (kind, job_id, priority, available_at, origin_at, max_attempts)
+        INSERT INTO work_queue (kind, job_id, priority, available_at, origin_at, max_attempts, rank_at)
         SELECT :kind, j, :priority, now() + make_interval(secs => :delay), coalesce(:origin, now()),
-               :max_attempts
+               :max_attempts,
+               CASE WHEN CAST(:kind AS text) = 'match' THEN (SELECT posted_at FROM jobs WHERE id = j) END
         FROM unnest(CAST(:ids AS bigint[])) AS j
         ON CONFLICT (kind, job_id) DO UPDATE SET
+            rank_at = coalesce(excluded.rank_at, work_queue.rank_at),
             generation = work_queue.generation + 1,
             priority = least(work_queue.priority, excluded.priority),
             available_at = CASE WHEN work_queue.state = 'dead' THEN excluded.available_at
@@ -100,8 +105,12 @@ def claim(conn: Connection, kind: str, owner: str, limit: int, lease_seconds: fl
             WHERE kind = :kind AND state <> 'dead' AND available_at <= now()
               AND (state = 'ready' OR lease_until < now())
             ORDER BY priority,
-                     -- matching is the paid bottleneck: newest discoveries first
-                     -- (as the legacy matcher did); filtering is FIFO
+                     -- matching is the paid bottleneck: the newest publication
+                     -- day first, then the newest discoveries (tasks queued
+                     -- before rank_at existed come after every dated one);
+                     -- filtering is FIFO
+                     CASE WHEN kind = 'match' THEN date_trunc('day', rank_at AT TIME ZONE 'UTC') END
+                         DESC NULLS LAST,
                      CASE WHEN kind = 'match' THEN -extract(epoch FROM origin_at) END,
                      available_at, id
             LIMIT :limit
@@ -217,6 +226,7 @@ class Board:
     last_bytes: int | None
     consecutive_failures: int
     snapshot_hash: str | None = None   # only while recent enough to trust (see claim_boards)
+    relevant: bool = False             # a posting passed the filters recently (relevant_at)
 
 
 def seed_boards(conn: Connection) -> int:
@@ -240,8 +250,10 @@ SNAPSHOT_TRUST_SECONDS = 24 * 3600
 
 
 def claim_boards(conn: Connection, collector: str, owner: str, limit: int,
-                 lease_seconds: float = 900) -> list[Board]:
-    """Lease the `limit` most overdue enabled boards of one provider."""
+                 lease_seconds: float = 900, *, prefer_relevant: bool = False,
+                 relevant_days: int = 14) -> list[Board]:
+    """Lease the `limit` most overdue enabled boards of one provider; with
+    prefer_relevant, due relevant boards (see mark_relevant) come first."""
     if limit <= 0:
         return []
     rows = conn.execute(text("""
@@ -249,7 +261,9 @@ def claim_boards(conn: Connection, collector: str, owner: str, limit: int,
             SELECT b.company_id FROM board_state b JOIN companies c ON c.id = b.company_id
             WHERE c.enabled AND c.collector = :collector AND b.next_due_at <= now()
               AND (b.lease_until IS NULL OR b.lease_until < now())
-            ORDER BY b.next_due_at, b.company_id
+            ORDER BY CASE WHEN :prefer AND b.relevant_at > now() - make_interval(days => :days)
+                          THEN 0 ELSE 1 END,
+                     b.next_due_at, b.company_id
             LIMIT :limit
             FOR UPDATE OF b SKIP LOCKED
         )
@@ -259,10 +273,37 @@ def claim_boards(conn: Connection, collector: str, owner: str, limit: int,
         WHERE b.company_id = picked.company_id AND c.id = b.company_id
         RETURNING b.company_id, c.name, c.collector, c.board, c.priority, b.last_bytes,
                   b.consecutive_failures,
-                  CASE WHEN b.snapshot_at > now() - make_interval(secs => :trust) THEN b.snapshot_hash END
+                  CASE WHEN b.snapshot_at > now() - make_interval(secs => :trust) THEN b.snapshot_hash END,
+                  coalesce(b.relevant_at > now() - make_interval(days => :days), false)
     """), {"collector": collector, "owner": owner, "limit": int(limit),
-           "lease": float(lease_seconds), "trust": float(SNAPSHOT_TRUST_SECONDS)}).all()
+           "lease": float(lease_seconds), "trust": float(SNAPSHOT_TRUST_SECONDS),
+           "prefer": bool(prefer_relevant), "days": int(relevant_days)}).all()
     return [Board(*r) for r in rows]
+
+
+def due_relevant(conn: Connection, relevant_days: int = 14) -> dict[str, float]:
+    """Per provider: `next_due_at` (epoch seconds) of its most overdue due relevant board."""
+    rows = conn.execute(text("""
+        SELECT c.collector,
+               min(CASE WHEN isfinite(b.next_due_at) THEN extract(epoch FROM b.next_due_at) ELSE -1e18 END)
+        FROM board_state b JOIN companies c ON c.id = b.company_id
+        WHERE c.enabled AND b.relevant_at > now() - make_interval(days => :days)
+          AND b.next_due_at <= now() AND (b.lease_until IS NULL OR b.lease_until < now())
+        GROUP BY c.collector
+    """), {"days": int(relevant_days)}).all()
+    return {r[0]: float(r[1]) for r in rows}
+
+
+def mark_relevant(conn: Connection, job_ids: list[int]) -> int:
+    """The boards of these jobs (which just passed the filters) are relevant now."""
+    if not job_ids:
+        return 0
+    return conn.execute(text("""
+        UPDATE board_state b SET relevant_at = now()
+        FROM companies c, jobs j
+        WHERE j.id = ANY(CAST(:ids AS bigint[])) AND c.collector = j.source AND c.board = j.board
+          AND b.company_id = c.id
+    """), {"ids": list(job_ids)}).rowcount
 
 
 def due_providers(conn: Connection) -> dict[str, int]:
@@ -320,10 +361,13 @@ def next_poll_delay(*, ok: bool, priority: int, failures: int, error: str | None
 
 def finish_board(conn: Connection, board: Board, owner: str, *, ok: bool, error: str | None,
                  fetched: int | None, nbytes: int | None, base_interval: float = 1800.0,
-                 retry_in: float | None = None, snapshot_hash: str | None = None) -> bool:
+                 retry_in: float | None = None, snapshot_hash: str | None = None,
+                 relevant_interval: float | None = None) -> bool:
     """Record a poll outcome and schedule the next one.
 
     `retry_in` reschedules without counting a failure (backpressure/shutdown).
+    `relevant_interval`: a healthy relevant board is due again after this long
+    instead of its priority interval (never later than that).
     `snapshot_hash` records the digest of a snapshot that was just fully
     ingested (and committed); unchanged polls pass None and keep the old one.
     Returns False if the lease was lost to another worker.
@@ -337,6 +381,8 @@ def finish_board(conn: Connection, board: Board, owner: str, *, ok: bool, error:
     failures = 0 if ok else board.consecutive_failures + 1
     delay = next_poll_delay(ok=ok, priority=board.priority, failures=failures, error=error,
                             base_interval=base_interval)
+    if ok and board.relevant and relevant_interval is not None:
+        delay = min(delay, relevant_interval * random.uniform(0.9, 1.1))
     return bool(conn.execute(text("""
         UPDATE board_state SET lease_owner = NULL, lease_until = NULL, last_finished_at = now(),
             next_due_at = now() + make_interval(secs => :delay),

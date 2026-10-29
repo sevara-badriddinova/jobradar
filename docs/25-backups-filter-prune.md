@@ -76,3 +76,26 @@ that are still listed as changed and rewrite them with full content (slow, but
 self-healing).
 
 Tests: 37 new (unit and PostgreSQL integration); all 1,185 pass.
+
+## Rollout (Oct 28)
+
+| Time (UTC) | Step |
+|---|---|
+| 13:15–14:33 | Manual backup: dump 1.61 GB in 69 min (would have failed at 45), archive verified, uploaded as `vm-backups/day-2.dump`; `backup.json` updated |
+| 14:01 | Cloud Build `033a180d-e138-41a3-a12d-eadc7095252a`: overlay on the deployed image `sha256:a3225d59…` after checking its package and profile hash-match the Oct 26 working tree; patched source hash-matches the tested tree; smoke test passed. Image `worker@sha256:bad57ddd7bb686da165e752e09db56242feca56c83ef8ea1d61c75a4b894283e` (tag `oct28-filter-prune`) |
+| 14:35 | First deploy rolled itself back: migration 0015 hit its 15-s lock timeout because a filter `UPDATE` from the stopped workers was still running (on this disk such a statement outlives its worker for minutes). Old image restored, schema unchanged |
+| 14:39–14:42 | Second deploy: workers and listener stopped, waited until no statement was active (30 s), migrated to 0015, restarted on the new image. `.env` backup: `.env.bak-20261028T143933Z` |
+| 14:48 | Title pass: 666 unfiltered open jobs rechecked by title, 157 rejected (index scan, ~6 min of random reads on this disk, once). New filter signature stored; AI queue 768 → 664 including new arrivals |
+| 14:55 | Prune estimate (1% sample): 35% of ~1.04M jobs, ~2.6 GB of stored text and payload |
+| 14:57 | Prune started beside the workers (`jobradar-prune.service`, batches of 2,000, shared maintenance lock) |
+| 15:07 | Prune paused after ~4,000 rows: one batch committed every 3–5 min (~10 rows/s), i.e. 9–14 h for all ~360k rows. Each pruned row writes a new tuple plus 12 index entries, all random I/O, and the 30 GB pd-standard boot disk serves very little random I/O. A rerun skips rows already pruned |
+
+The disk is also why collection runs 33 h behind, filter batches take minutes and the
+dump takes 69 min. Finishing the prune and compacting the table needs either a faster
+disk (pd-balanced, SSD-backed) or a long overnight window with the workers stopped.
+
+Backup headroom: today's dump took 69 of the 90 minutes allowed and grows with the
+table, so the 90-min limit lasts days to a few weeks, not months, without the prune.
+
+Rollback: restore `.env.bak-20261028T143933Z`, then `systemctl restart jobradar-workers`
+and `docker compose up -d --no-deps listener` in `/opt/jobradar`. Migration 0015 can stay.
