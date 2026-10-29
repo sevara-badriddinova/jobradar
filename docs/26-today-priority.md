@@ -76,3 +76,19 @@ No filter rule changed: the filter-policy signature stays
 - 90+ is rare. Expect few alerts: about 1 in 300 scored jobs so far.
 - Options for more coverage, not enabled: a higher daily budget, or the Message
   Batches API (half the price per call, results within 24 hours).
+
+## Update (Oct 29, 15:00 UTC): hourly fast lane turned off
+
+The 14:41 UTC check showed change 4 backfired. Board polls fell from ~1,440 an hour
+(08:59–13:11 UTC) to ~320 (13:21–14:48 UTC). Overdue boards grew from 6,347 to 8,364,
+and the median lag went from 18 to 95 minutes. The ~550 relevant boards are the
+biggest employers (238 on Workday): the slowest to fetch and ingest on this disk,
+with 3x more byte-budget backpressure. Visiting them hourly crowded out the other
+~12,000.
+
+`WorkerConfig.relevant_interval` now defaults to `None`, which turns the lane off:
+no shortened interval, no slot preference, no `due_relevant` query. Boards are still
+marked relevant (`relevant_at`), so the lane can be turned back on later with a
+smaller share. Image `worker@sha256:654f934900eb2ddb4d84181b29c70cb88847ad8bdec066ca9e75d0076b10e241`
+(tag `oct29-no-fast-lane`, Cloud Build `77d351a1-c1f7-4c3b-b435-aa921e990171`).
+

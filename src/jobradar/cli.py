@@ -369,6 +369,14 @@ def cmd_prune_content(args) -> int:
               f"~{row.bytes / row.sampled * total / 2**20:,.1f} MB of stored text and payload")
         print("run again with --yes to prune")
         return 0
+    if args.rewrite:
+        # One exclusive rewrite that also compacts the table: workers must be stopped.
+        from jobradar.prune import rewrite_prune
+        done = rewrite_prune(engine, min_age_days=args.min_age_days, posted_before_days=args.posted_before_days,
+                             statement_timeout_s=int(args.max_hours * 3600))
+        print(f"rewrite: jobs {done.before_bytes / 2**20:,.0f} MB -> {done.after_bytes / 2**20:,.0f} MB "
+              f"in {done.seconds / 60:,.1f} min, ~{done.pruned_estimate:,} rows pruned in total")
+        return 0
     result = prune_content(engine, min_age_days=args.min_age_days, posted_before_days=args.posted_before_days,
                            batch=args.batch, limit=args.limit, pause=args.pause, start_after=args.start_after)
     print(f"pruned {result.pruned} jobs in {result.batches} batches (through id {result.last_id})")
@@ -891,6 +899,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--limit", type=positive_int, help="stop after this many rows")
     p.add_argument("--pause", type=float, default=0.0, help="seconds to sleep between batches")
     p.add_argument("--start-after", type=int, default=0, help="resume after this job id")
+    p.add_argument("--rewrite", action="store_true",
+                   help="prune and compact in one exclusive table rewrite (stop the workers first)")
+    p.add_argument("--max-hours", type=float, default=5.0,
+                   help="--rewrite: cancel and roll back after this long")
     p.set_defaults(func=cmd_prune_content)
 
     p = sub.add_parser("notify", help="send Telegram alerts for new matches and apply button presses")

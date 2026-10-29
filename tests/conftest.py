@@ -11,3 +11,9 @@ def pytest_collection_modifyitems(config, items):
         parts = Path(item.fspath).relative_to(_TESTS).parts
         if parts and parts[0] in ("unit", "integration"):
             item.add_marker(getattr(pytest.mark, parts[0]))
+
+
+@pytest.fixture(autouse=True)
+def _no_screen_stage(monkeypatch):
+    """Tests drive one model unless they opt into the two-stage scoring (matcher.assess)."""
+    monkeypatch.setenv("JOBRADAR_SCREEN_MODEL", "off")

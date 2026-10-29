@@ -37,6 +37,18 @@ DEFAULT_MODEL = "claude-haiku-4-5-20251001"  # one call per job: the fast, cheap
 MAX_DESCRIPTION_CHARS = 12_000  # long postings are mostly benefits/boilerplate at the end
 MAX_CONSECUTIVE_FAILURES = 3
 
+# Two-stage scoring (Oct 29). Every job is first assessed by a much cheaper
+# model; only those it scores at least SCREEN_MIN_SCORE get the main model's
+# assessment, which is the score stored and used for alerts, so thresholds keep
+# their meaning. Measured on 23 production jobs: Haiku 5.5 costs ~$0.002 a job
+# against ~$0.012 and scores ~8-10 points lower (the main model's 90 -> 74,
+# 80-83 -> 70-74); the gate sits well below that. Screened-out jobs keep the
+# screen's assessment. JOBRADAR_SCREEN_MODEL=off disables the stage. The
+# screen is not part of the context hash: changing it re-scores nothing.
+SCREEN_MODEL = "claude-haiku-5-5"
+SCREEN_MIN_SCORE = 60.0
+SCREEN_MAX_TOKENS = 4096   # it reasons before answering; 2048 ran out once in 35 calls
+
 
 class HardBlocker(BaseModel):
     kind: Literal["experience", "sponsorship", "citizenship", "degree", "graduation", "skill", "role"]
@@ -187,11 +199,23 @@ def verified_blockers(assessment: MatchAssessment, job, profile: dict, preferenc
     return valid
 
 
-def assess_with_review(job, profile: dict, preferences: Preferences) -> MatchAssessment:
+def assess(job, profile: dict, preferences: Preferences) -> tuple[MatchAssessment, str]:
+    """(assessment, model that made it): the screen first, the main model if it passes."""
+    screen = screen_model()
+    if screen and screen != model_name():
+        first = assess_with_review(job, profile, preferences, model=screen, max_tokens=SCREEN_MAX_TOKENS)
+        if score(first) < screen_min_score():
+            return first, screen
+    return assess_with_review(job, profile, preferences), model_name()
+
+
+def assess_with_review(job, profile: dict, preferences: Preferences, *, model: str | None = None,
+                       max_tokens: int = 2048) -> MatchAssessment:
+    model = model or model_name()
     profile = normalize_experience(profile)
     prompt = build_prompt(job, profile, preferences)
     answer = llm.ask(MatchAssessment, system=SYSTEM, prompt=prompt,
-                     model=model_name(), max_tokens=2048)
+                     model=model, max_tokens=max_tokens)
     skills = known_skills(profile)
     if (not answer.eligible or answer.graduation_match is False
             or any(_normalized(s) in skills for s in answer.missing_skills)):
@@ -199,7 +223,7 @@ def assess_with_review(job, profile: dict, preferences: Preferences) -> MatchAss
             "Correct unsupported rejections, ignored full-time employment, and false missing skills. "
             "Return a complete corrected assessment, including recalculated fit dimensions.",
             prompt=prompt + "\n<prior_assessment>\n" + answer.model_dump_json() + "\n</prior_assessment>",
-            model=model_name(), max_tokens=2048)
+            model=model, max_tokens=max_tokens)
     valid = verified_blockers(answer, job, profile, preferences)
     updates = {"hard_blockers": valid,
                "missing_skills": [s for s in answer.missing_skills if _normalized(s) not in skills]}
@@ -237,6 +261,15 @@ Locations: {locations}
 
 def model_name() -> str:
     return os.environ.get("JOBRADAR_MATCH_MODEL", DEFAULT_MODEL)
+
+
+def screen_model() -> str | None:
+    value = os.environ.get("JOBRADAR_SCREEN_MODEL", SCREEN_MODEL).strip()
+    return None if value.lower() in ("", "off", "none") else value
+
+
+def screen_min_score() -> float:
+    return float(os.environ.get("JOBRADAR_SCREEN_MIN_SCORE", SCREEN_MIN_SCORE))
 
 
 def invalidate_stale_matches(conn, profile, preferences) -> int:
@@ -338,10 +371,10 @@ def _assess(engine: Engine, job: Row, profile: Row, preferences: Preferences, ke
     if stored:
         return stored.id, float(stored.score), True
 
-    assessment = assess_with_review(job, profile.profile, preferences)
+    assessment, model = assess(job, profile.profile, preferences)
     match_score = score(assessment)
     with engine.begin() as conn:
-        values = dict(job_id=job.id, profile_id=profile.id, context_hash=key, model=model_name(),
+        values = dict(job_id=job.id, profile_id=profile.id, context_hash=key, model=model,
                       prompt_version=PROMPT_VERSION, assessment=assessment.model_dump(mode="json"),
                       score=match_score)
         match_id = conn.execute(insert(job_matches).values(**values)

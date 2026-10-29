@@ -84,13 +84,15 @@ class WorkerConfig:
     match_concurrency: int = 2
     ai_daily_budget_usd: float | None = None  # None: record spend, never pause
     ai_budget_paced: bool = False          # grow the cap hourly through the UTC day (ai_budget.py)
-    # Boards whose postings passed the filters in the last `relevant_days` are
-    # revisited every `relevant_interval` (per-provider override), and half the
-    # collection slots go to the most overdue of them first; the other half keep
-    # the age order, so other boards are never starved. Workday polls take ~24 s
-    # (vs ~2 s elsewhere), so its relevant boards get 2 h to leave room for the rest.
+    # Optional fast lane: boards whose postings passed the filters in the last
+    # `relevant_days` are revisited every `relevant_interval` (per-provider
+    # override), and odd collection slots go to the most overdue of them first.
+    # Off by default (None): in production (Oct 29) it cut board polls from
+    # ~1,440/h to ~320/h. Those boards are the biggest employers, whose polls are
+    # the slowest to fetch and ingest on the VM's disk, so hourly visits to ~550
+    # of them crowded out the other ~12,000. Boards are still marked relevant.
     relevant_days: int = 14
-    relevant_interval: float = 3600.0
+    relevant_interval: float | None = None
     relevant_interval_by_provider: dict[str, float] = field(default_factory=lambda: {"workday": 7200.0})
     digest_interval: float = 900.0
     idle_sleep: float = 5.0
@@ -180,7 +182,9 @@ class Worker:
     def provider_limit(self, provider: str) -> int:
         return self.cfg.provider_concurrency.get(provider, self.cfg.default_provider_concurrency)
 
-    def relevant_interval(self, provider: str) -> float:
+    def relevant_interval(self, provider: str) -> float | None:
+        if self.cfg.relevant_interval is None:
+            return None
         return self.cfg.relevant_interval_by_provider.get(provider, self.cfg.relevant_interval)
 
     def claim_boards(self, free: int) -> list[q.Board]:
@@ -206,7 +210,8 @@ class Worker:
     def _refresh_due(self) -> dict[str, tuple[int, float]]:
         with self.engine.begin() as conn:
             due = q.due_overview(conn)
-            self._relevant_due = q.due_relevant(conn, self.cfg.relevant_days)
+            self._relevant_due = (q.due_relevant(conn, self.cfg.relevant_days)
+                                  if self.cfg.relevant_interval is not None else {})
         self._due_cache = (due, time.monotonic())
         return due
 
@@ -220,9 +225,9 @@ class Worker:
         Even slots rotate: they go to the due provider served least recently,
         so every provider with due boards is polled within one rotation
         (providers / 2 slots... claims) however large the other backlogs are.
-        Odd slots go first to the provider holding the most overdue relevant
-        board (one whose postings recently passed the filters), and take that
-        board; with none due, to the provider holding the most overdue board,
+        Odd slots go (with the optional fast lane on) first to the provider
+        holding the most overdue relevant board, and take that board; otherwise
+        to the provider holding the most overdue board,
         which keeps big providers served in proportion to their backlog. The
         old "largest backlog takes every slot" rule starved small providers.
         """

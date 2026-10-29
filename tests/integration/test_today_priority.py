@@ -212,7 +212,8 @@ def test_half_the_slots_go_to_relevant_boards_and_the_rest_by_age(engine):
     for i in range(3):
         make_relevant(engine, f"ashby-{i}")
         due_minutes_ago(engine, f"ashby-{i}", 2)               # barely due
-    w = worker(engine, collect_concurrency=4, provider_concurrency={"greenhouse": 4, "ashby": 4})
+    w = worker(engine, collect_concurrency=4, provider_concurrency={"greenhouse": 4, "ashby": 4},
+               relevant_interval=3600.0)
     claimed = w.claim_boards(4)
     relevant = [b for b in claimed if b.relevant]
     assert len(relevant) == 2                                  # the two odd slots
@@ -220,8 +221,23 @@ def test_half_the_slots_go_to_relevant_boards_and_the_rest_by_age(engine):
 
 
 def test_workday_relevant_boards_get_two_hours(engine):
-    w = worker(engine)
+    w = worker(engine, relevant_interval=3600.0)
     assert w.relevant_interval("greenhouse") == 3600 and w.relevant_interval("workday") == 7200
+
+
+def test_fast_lane_is_off_by_default(engine):
+    """Oct 29: hourly visits to the busiest boards cut production polling ~4.5x."""
+    seed(engine, {"greenhouse": 6, "ashby": 6})
+    set_due(engine, "greenhouse", 600)
+    set_due(engine, "ashby", 600)
+    for i in range(3):
+        make_relevant(engine, f"ashby-{i}")
+        due_minutes_ago(engine, f"ashby-{i}", 2)
+    w = worker(engine, collect_concurrency=4, provider_concurrency={"greenhouse": 4, "ashby": 4})
+    assert w.relevant_interval("greenhouse") is None and w.relevant_interval("workday") is None
+    claimed = w.claim_boards(4)
+    assert len(claimed) == 4 and not any(b.relevant for b in claimed)   # plain age order
+    assert w._relevant_due == {}
 
 
 # --- the deploy: migration 0016 seeds relevant boards from recent AI work ---------------------

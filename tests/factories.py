@@ -140,7 +140,8 @@ class FakeLLM:
         self.calls: list[dict[str, Any]] = []
 
     def __call__(self, output: type, *, system: str, prompt: str, model: str, max_tokens: int = 4096):
-        self.calls.append({"output": output, "system": system, "prompt": prompt, "model": model})
+        self.calls.append({"output": output, "system": system, "prompt": prompt, "model": model,
+                           "max_tokens": max_tokens})
         answer = self.answers[min(len(self.calls), len(self.answers)) - 1]
         if isinstance(answer, BaseException):
             raise answer

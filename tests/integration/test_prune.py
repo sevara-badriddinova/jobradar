@@ -151,3 +151,80 @@ def test_cli_estimates_without_changing_anything(stored, db_env, capsys):
     assert "pruned 2 jobs" in capsys.readouterr().out
     with stored.connect() as conn:
         assert conn.execute(text("SELECT count(*) FROM jobs WHERE raw_digest IS NOT NULL")).scalar_one() == 2
+
+
+# --- one-pass rewrite (Oct 29) -------------------------------------------------
+
+def relfilenode(engine):
+    with engine.connect() as conn:
+        return conn.execute(text("SELECT relfilenode FROM pg_class WHERE relname = 'jobs'")).scalar_one()
+
+
+def indexes(engine):
+    with engine.connect() as conn:
+        return conn.execute(text("""SELECT i.relname, x.indisvalid FROM pg_index x
+            JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'jobs'::regclass ORDER BY 1""")).all()
+
+
+def test_rewrite_prunes_exactly_what_the_batches_prune(stored):
+    from jobradar.prune import rewrite_prune
+    raws = {sid: row(stored, sid).raw for sid in ("old", "dup")}
+    before_indexes, before_node = indexes(stored), relfilenode(stored)
+    result = rewrite_prune(stored)
+    assert pruned(stored, "old") and pruned(stored, "dup")
+    for sid in ("young", "recent", "passed", "held"):
+        assert row(stored, sid).raw_digest is None and row(stored, sid).description == TEXT
+    with stored.connect() as conn:   # the same digest ingestion compares against
+        for sid, raw in raws.items():
+            expected = conn.execute(text("SELECT md5(CAST(CAST(:r AS jsonb) AS text))"),
+                                    {"r": __import__("json").dumps(raw)}).scalar_one()
+            assert row(stored, sid).raw_digest == expected
+    assert relfilenode(stored) != before_node                   # rewritten, i.e. compacted
+    assert indexes(stored) == before_indexes and all(valid for _, valid in before_indexes)
+    assert result.seconds >= 0 and result.after_bytes > 0
+
+
+def test_rewrite_matches_batch_digests_including_workday(engine):
+    from jobradar.prune import rewrite_prune
+    ingest(engine, [job("wd-a", source="workday")], source="workday")
+    ingest(engine, [job("wd-b", source="workday")], source="workday", board="other")
+    for sid, posted in (("wd-a", "Posted Today"), ("wd-b", "Posted 3 Days Ago")):
+        age(engine, sid, days=10, source="workday", closed_at=func.now(),
+            raw={"id": 7, "postedOn": posted})
+    prune_content(engine, limit=1)                              # wd-a by the batch path
+    rewrite_prune(engine)                                       # wd-b by the rewrite
+    a, b = row(engine, "wd-a", "workday"), row(engine, "wd-b", "workday")
+    assert a.raw_digest == b.raw_digest and pruned(engine, "wd-b", "workday")
+
+
+def test_an_unchanged_posting_is_not_rewritten_after_the_rewrite(stored):
+    from jobradar.prune import rewrite_prune
+    rewrite_prune(stored)
+    before = row(stored, "old")
+    ingest(stored, [job("old")])
+    after = row(stored, "old")
+    assert (after.raw, after.description, after.raw_digest, after.content_changed_at) == (
+        before.raw, before.description, before.raw_digest, before.content_changed_at)
+
+
+def test_rewrite_refuses_thresholds_inside_the_freshness_window(engine):
+    from jobradar.prune import rewrite_statement
+    with pytest.raises(ValueError):
+        rewrite_statement(posted_before_days=7)
+
+
+def test_rewrite_times_out_without_changing_anything(stored, monkeypatch):
+    from sqlalchemy.exc import OperationalError
+    from jobradar import prune
+    monkeypatch.setattr(prune, "rewrite_statement", lambda **kw: "SELECT pg_sleep(5)")
+    node = relfilenode(stored)
+    with pytest.raises(OperationalError):
+        prune.rewrite_prune(stored, statement_timeout_s=1)
+    assert relfilenode(stored) == node and not pruned(stored, "old")
+
+
+def test_cli_rewrite(stored, db_env, capsys):
+    from jobradar.cli import main
+    assert main(["prune-content", "--rewrite", "--yes"]) == 0
+    assert "rewrite: jobs" in capsys.readouterr().out
+    assert pruned(stored, "old") and not pruned(stored, "young")
