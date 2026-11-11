@@ -31,7 +31,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import OperationalError
 
@@ -254,6 +254,10 @@ def cmd_match(args) -> int:
     except llm.BudgetExceeded as exc:
         print(f"{exc}; remaining jobs stay queued for tomorrow", file=sys.stderr)
         return 0
+    except llm.CredentialsRejected as exc:
+        print(f"the AI provider rejected the credentials ({exc.reason}); no job was marked failed",
+              file=sys.stderr)
+        return 2
     print(f"assessed {result.assessed}, reused {result.cached} cached, failed {result.failed}")
     if result.aborted:
         print("stopped early after repeated failures (see the errors above)", file=sys.stderr)
@@ -763,6 +767,11 @@ def cmd_metrics(args) -> int:
 def cmd_requeue(args) -> int:
     """Explicitly re-run a stage for some jobs, or make boards due now."""
     from jobradar import queue
+    if args.dead:
+        return requeue_dead_matches(args)
+    if args.dry_run:
+        print("--dry-run is only supported with --dead", file=sys.stderr)
+        return 2
     with make_engine().begin() as conn:
         if args.stage == "boards":
             n = queue.requeue_boards(conn, args.targets or None)
@@ -778,6 +787,37 @@ def cmd_requeue(args) -> int:
                 jobs.c.status.in_(["DISCOVERED", "REPOSTED"]), jobs.c.filtered_at.is_not(None))).scalars().all()
         n = queue.enqueue(conn, args.stage, ids, priority=50)
     print(f"{n} {args.stage} task(s) queued")
+    return 0
+
+
+def requeue_dead_matches(args) -> int:
+    """Revive dead match tasks whose jobs could still be scored and alerted:
+    open, past the filters, not reviewed, and inside the freshness window.
+    Older ones stay dead; matching would skip them anyway."""
+    from jobradar import queue
+    from jobradar.db import work_queue
+    from jobradar.recency import recent_jobs
+    if args.stage != "match" or args.targets:
+        print("--dead applies to the match stage only, without job ids", file=sys.stderr)
+        return 2
+    try:
+        filters = load_settings(args.profile).filters
+    except SettingsError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    dead = (work_queue.c.kind == "match") & (work_queue.c.state == "dead")
+    with make_engine().begin() as conn:
+        total = conn.execute(select(func.count()).select_from(work_queue).where(dead)).scalar_one()
+        ids = conn.execute(select(work_queue.c.job_id).join(jobs, jobs.c.id == work_queue.c.job_id).where(
+            dead, jobs.c.status.in_(["DISCOVERED", "REPOSTED"]), jobs.c.filtered_at.is_not(None),
+            jobs.c.closed_at.is_(None), not_skipped(),
+            recent_jobs(filters.max_posting_age_days, discovery_days=filters.max_discovery_age_days),
+        )).scalars().all()
+        if not args.dry_run:
+            queue.enqueue(conn, "match", ids, priority=50)
+    verb = "would requeue" if args.dry_run else "requeued"
+    print(f"{verb} {len(ids)} of {total} dead match task(s); the rest are too old, closed, "
+          f"reviewed or already scored")
     return 0
 
 
@@ -849,6 +889,9 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("requeue", help="explicitly queue jobs for a stage, or make boards due now")
     p.add_argument("stage", choices=["filter", "match", "boards"])
     p.add_argument("targets", nargs="*", help="job ids (filter/match) or board/company names (boards)")
+    p.add_argument("--dead", action="store_true",
+                   help="match only: revive dead tasks whose jobs are still fresh and eligible")
+    p.add_argument("--dry-run", action="store_true", help="with --dead: count, change nothing")
     p.set_defaults(func=cmd_requeue)
 
     p = sub.add_parser("cycle", help="run one scheduled collection/filter cycle, then exit")

@@ -19,6 +19,28 @@ class LLMError(Exception):
     """The model call failed or didn't return the requested structure."""
 
 
+class CredentialsRejected(LLMError):
+    """The provider refused the account, not the request: a missing, revoked or
+    invalid key, no permission, or no credit left. Retrying a job cannot help,
+    so queue workers pause and keep the work queued instead of charging
+    attempts (Nov 11: a dead key buried every match task for two days).
+    `reason` is short and safe to show in an alert."""
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason = reason
+
+
+def _credentials_reason(exc: Exception) -> str | None:
+    if isinstance(exc, anthropic.AuthenticationError):
+        return "401 invalid or revoked API key"
+    if isinstance(exc, anthropic.PermissionDeniedError):
+        return "403 key lacks permission"
+    if isinstance(exc, anthropic.BadRequestError) and "credit balance" in str(exc).lower():
+        return "account credit balance too low"
+    return None
+
+
 class BudgetExceeded(Exception):
     """Today's AI spending cap is reached. Not an LLMError: callers must keep the
     work queued for later instead of counting it as a failed attempt."""
@@ -64,7 +86,8 @@ def set_meter(meter) -> None:
 def _client() -> anthropic.Anthropic:
     # Without this check the SDK fails at request time with a bare TypeError.
     if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
-        raise LLMError("ANTHROPIC_API_KEY is not set (create a key at https://console.anthropic.com)")
+        raise CredentialsRejected("ANTHROPIC_API_KEY is not set",
+                                  "create a key at https://console.anthropic.com")
     return anthropic.Anthropic()
 
 
@@ -78,6 +101,9 @@ def ask(output: type[T], *, system: str, prompt: str, model: str, max_tokens: in
             messages=[{"role": "user", "content": prompt}], output_format=output,
         )
     except (anthropic.AnthropicError, ValidationError) as exc:
+        reason = _credentials_reason(exc)
+        if reason:
+            raise CredentialsRejected(reason, f"{type(exc).__name__}: {exc}") from exc
         raise LLMError(f"{type(exc).__name__}: {exc}") from exc
     usage = getattr(response, "usage", None)
     if _meter is not None and usage is not None:

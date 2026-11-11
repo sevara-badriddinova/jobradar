@@ -134,3 +134,11 @@ def test_stage_health_distinguishes_budget_idle_maintenance_and_real_failures():
     runtime["stages"]["match-0"]["stalled"] = False
     runtime["notify_fail_streak"] = 3
     assert "delivery" in worker_diagnosis({"runtime": runtime}, NOW)
+
+
+def test_rejected_api_key_is_reported_by_name():
+    runtime = dict(checked_at=NOW.timestamp(), state="running", matching_auth_paused=True,
+                   stages={"match-0": {"alive": True, "stalled": False, "state": "auth_paused"}})
+    assert "rejecting the API key" in worker_diagnosis({"runtime": runtime}, NOW)
+    runtime["matching_auth_paused"] = False
+    assert worker_diagnosis({"runtime": runtime}, NOW) is None

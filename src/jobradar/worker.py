@@ -24,6 +24,7 @@ application history, and existing filter behaviour are unchanged.
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import logging
 import os
@@ -60,6 +61,16 @@ log = logging.getLogger(__name__)
 
 ALL_ROLES = frozenset({"schedule", "collect", "filter", "match", "notify"})
 MB = 1024 * 1024
+# app_state row that exists while a "scoring is down" alert is open. Claiming it
+# makes the alert once-only across restarts and parallel workers; deleting it
+# sends the single recovery message.
+SCORING_ALERT_KEY = "scoring_down_alert"
+SCORING_DOWN_TEXT = ("⚠️ <b>JobRadar: AI scoring is down</b>\n"
+                     "The AI provider rejected the account ({reason}). New jobs stay queued without "
+                     "using up retries, and scoring resumes on its own once the key works.\n"
+                     "Fix: add a new version of <code>jobradar-anthropic-key</code> in Secret Manager "
+                     "and point the VM at it.")
+SCORING_BACK_TEXT = "✅ <b>JobRadar: AI scoring is working again.</b> Queued jobs are being scored now."
 
 
 class WorkerFailed(RuntimeError):
@@ -85,6 +96,9 @@ class WorkerConfig:
     filter_batch: int = 200
     match_batch: int = 4
     match_max_attempts: int = 12           # ~1 day of backoff during an LLM outage
+    # A rejected API key pauses matching (no attempts charged) and is retried
+    # with one batch this often; a 401 costs nothing.
+    auth_recheck_interval: float = 600.0
     max_filter_backlog: int = 20000        # backpressure: pause collection above this
     max_match_backlog: int | None = None   # matching never blocks discovery by default
     match_concurrency: int = 2
@@ -142,6 +156,9 @@ class Worker:
         self.meter = DailyBudgetMeter(engine, config.ai_daily_budget_usd, paced=config.ai_budget_paced)
         llm.set_meter(self.meter)
         self._budget_recheck = 0.0
+        self._auth_recheck = 0.0               # matching paused until (monotonic) after a rejected key
+        self._auth_reason: str | None = None
+        self._scoring_alert_checked = False    # an alert may be open from a previous process
         self.profile_path = profile_path
         self.discover, self.heartbeat = discover, heartbeat
         self.owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:6]}"
@@ -200,6 +217,7 @@ class Worker:
                 "oldest_collection_seconds": round(oldest, 1),
                 "collection_stalled": oldest > self.cfg.collection_timeout,
                 "matching_budget_paused": time.monotonic() < self._budget_recheck,
+                "matching_auth_paused": self.auth_paused(),
                 "listener": read_json(self.control_dir / "status/listener.json") if self.control_dir else None,
                 "match_fail_streak": self._match_fail_streak,
                 "notify_fail_streak": self._notify_fail_streak}
@@ -518,10 +536,49 @@ class Worker:
             return True
         return False
 
+    def auth_paused(self) -> bool:
+        """True while the AI provider is rejecting our credentials. Tasks stay queued."""
+        return time.monotonic() < self._auth_recheck
+
+    def _scoring_alert(self, reason: str | None) -> None:
+        """Send one Telegram message when scoring goes down (reason) and one when
+        it recovers (None). The open alert lives in app_state, so a restart or a
+        second worker never repeats either message. Never raises."""
+        if self.telegram is None:
+            return
+        tg, chat_id = self.telegram
+        try:
+            with self.engine.begin() as conn:
+                if reason is not None:
+                    claimed = conn.execute(text("""INSERT INTO app_state (key, value) VALUES (:k, :v)
+                        ON CONFLICT (key) DO NOTHING RETURNING key"""),
+                        {"k": SCORING_ALERT_KEY, "v": json.dumps(
+                            {"since": time.time(), "reason": reason})}).first()
+                else:
+                    claimed = conn.execute(text("DELETE FROM app_state WHERE key = :k RETURNING key"),
+                                           {"k": SCORING_ALERT_KEY}).first()
+        except Exception:
+            log.exception("could not record the scoring alert state")
+            return
+        if claimed is None:
+            return  # already alerted (down), or nothing was open (recovery)
+        message = (SCORING_DOWN_TEXT.format(reason=html.escape(reason)) if reason is not None
+                   else SCORING_BACK_TEXT)
+        try:
+            tg.send_message(chat_id, message)
+            self.count("scoring_alerts_sent")
+        except Exception as exc:
+            log.warning("scoring %s alert not sent: %s", "down" if reason else "recovery", exc)
+            if reason is not None and not getattr(exc, "maybe_delivered", False):
+                with self.engine.begin() as conn:  # certainly not delivered: the next pause retries
+                    conn.execute(text("DELETE FROM app_state WHERE key = :k"), {"k": SCORING_ALERT_KEY})
+
     def match_once(self) -> int:
         if self.low_load():
             return 0
         if self.budget_paused():
+            return 0
+        if self.auth_paused():
             return 0
         with self.engine.begin() as conn:
             tasks = q.claim(conn, "match", self.owner, self.cfg.match_batch, self.cfg.task_lease)
@@ -550,6 +607,21 @@ class Worker:
             self.count("match_budget_pauses")
             log.warning("%s; %d match task(s) kept queued", exc, len(tasks))
             return 0
+        except llm.CredentialsRejected as exc:
+            # The key/account is refused: no job is at fault. Keep every task
+            # (no attempt charged), pause, alert once, and retry one batch later.
+            interval = self.cfg.auth_recheck_interval
+            with self.engine.begin() as conn:
+                q.release(conn, tasks, self.owner, delay=interval)
+            self._auth_recheck = time.monotonic() + interval
+            first = self._auth_reason is None
+            self._auth_reason = exc.reason
+            self.count("match_auth_pauses")
+            log.error("AI provider rejected the credentials (%s); matching paused for %d min, "
+                      "%d match task(s) kept queued", exc.reason, interval // 60, len(tasks))
+            if first:
+                self._scoring_alert(exc.reason)
+            return 0
         except Exception as exc:
             log.exception("match batch crashed")
             with self.engine.begin() as conn:
@@ -575,6 +647,12 @@ class Worker:
         self.count("match_done", len(tasks) - len(failed))
         self.count("match_failed", len(failed))
         self._match_fail_streak = self._match_fail_streak + 1 if failed and len(failed) == len(attempted) else 0
+        if result.assessed and (self._auth_reason is not None or not self._scoring_alert_checked):
+            # A real model call succeeded: close any open "scoring is down" alert,
+            # including one left open by a previous process.
+            self._auth_reason = None
+            self._scoring_alert_checked = True
+            self._scoring_alert(None)
         if queued:
             self.wake["notify"].set()
         return len(tasks)
@@ -666,7 +744,9 @@ class Worker:
                 self.stop.wait(min(300, 5 * 2 ** min(errors, 6)))
                 continue
             if not done:
-                self.touch("budget_paused" if name == "match" and time.monotonic() < self._budget_recheck else "idle")
+                paused = ("budget_paused" if time.monotonic() < self._budget_recheck
+                          else "auth_paused" if self.auth_paused() else None) if name == "match" else None
+                self.touch(paused or "idle")
                 self.wake[name].wait(self.cfg.idle_sleep)
                 self.wake[name].clear()
 
@@ -749,7 +829,8 @@ class Worker:
         # Never hold the supervision/counter lock across database I/O.
         ai = {"spent_today_usd": round(self.meter.spent(), 4),
               "daily_budget_usd": self.cfg.ai_daily_budget_usd,
-              "allowed_so_far_usd": self.meter.allowance()}
+              "allowed_so_far_usd": self.meter.allowance(),
+              "auth_paused": self.auth_paused(), "auth_error": self._auth_reason}
         with self._lock:
             data["ai"] = ai
             data["worker"] = dict(self.counters, owner=self.owner, byte_budget_peak=self.budget.peak,

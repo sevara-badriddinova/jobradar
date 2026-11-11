@@ -56,6 +56,8 @@ def worker_diagnosis(progress, now):
             return "Telegram listener is stale or reporting connection errors."
     if runtime.get("notify_fail_streak", 0) >= 3:
         return "Telegram notification delivery is repeatedly failing."
+    if runtime.get("matching_auth_paused"):
+        return "The AI provider is rejecting the API key; matching is paused with work kept queued."
     if runtime.get("match_fail_streak", 0) >= 3 and not runtime.get("matching_budget_paused"):
         return "AI matching is repeatedly failing."
     if any(s.get("state") == "error" for s in runtime.get("stages", {}).values()):
