@@ -29,6 +29,7 @@ import sys
 import httpx
 import time
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
@@ -492,10 +493,20 @@ def cmd_telegram_setup(args) -> int:
 
 
 def cmd_telegram_listen(args) -> int:
+    from jobradar.runtime import atomic_json
     if (env := _telegram_env()) is None:
         return 2
     token, chat_id = env
-    engine = make_engine()
+    engine = make_engine(connect_args={"options": "-c statement_timeout=60000 -c lock_timeout=5000"})
+    control = os.environ.get("JOBRADAR_CONTROL_DIR")
+    last_status = 0.0
+
+    def listener_status(error=None):
+        nonlocal last_status
+        if control and time.monotonic() - last_status >= 5:
+            atomic_json(Path(control) / "status/listener.json",
+                        {"checked_at": time.time(), "state": "running", "error": error})
+            last_status = time.monotonic()
     try:
         settings = load_settings(args.profile)
     except SettingsError as exc:
@@ -518,10 +529,13 @@ def cmd_telegram_listen(args) -> int:
                         print(f"applied {pressed} button press(es)")
                     else:
                         time.sleep(1)  # another listener may own the update-consumer lock
+                    listener_status()
                 except TelegramError as exc:
+                    listener_status("Telegram unavailable")
                     logging.getLogger(__name__).warning("telegram: %s; retrying in 1s", exc)
                     time.sleep(1)
                 except OperationalError:
+                    listener_status("Database unavailable")
                     # A sleeping database or dropped connection must not kill
                     # live buttons. Do not log URLs, SQL parameters, or secrets.
                     logging.getLogger(__name__).warning("database unavailable; retrying in 5s")
@@ -667,7 +681,7 @@ def cmd_worker(args) -> int:
 
     from jobradar.cycle import cycle_lock
     from jobradar.health import record_progress
-    from jobradar.worker import ALL_ROLES, Worker, WorkerConfig
+    from jobradar.worker import ALL_ROLES, Worker, WorkerConfig, WorkerFailed
 
     roles = frozenset(r.strip() for r in args.roles.split(",") if r.strip())
     if not roles <= ALL_ROLES:
@@ -689,13 +703,18 @@ def cmd_worker(args) -> int:
     config = WorkerConfig(roles=roles, collect_concurrency=args.collect_concurrency,
                           base_interval=args.base_interval_minutes * 60,
                           byte_budget=args.byte_budget_mb * 1024 * 1024,
-                          ai_daily_budget_usd=budget, ai_budget_paced=pacing_from_env())
+                          ai_daily_budget_usd=budget, ai_budget_paced=pacing_from_env(),
+                          control_dir=os.environ.get("JOBRADAR_CONTROL_DIR"),
+                          cleanup_enabled=os.environ.get("JOBRADAR_ONLINE_CLEANUP") == "1")
     pool = config.collect_concurrency + 4
-    engine = make_engine(pool_size=pool, max_overflow=2, pool_timeout=60)
+    engine = make_engine(pool_size=pool, max_overflow=2, pool_timeout=30,
+                         connect_args={"options": "-c statement_timeout=300000 -c lock_timeout=10000 "
+                                      "-c idle_in_transaction_session_timeout=60000"})
 
     def discover():
         main(["--profile", args.profile, "companies", "discover"])
 
+    worker, exit_code = None, 0
     try:
         # Mutual exclusion with the legacy cycle: hold its lock for our lifetime.
         with cycle_lock(engine) as acquired:
@@ -705,14 +724,23 @@ def cmd_worker(args) -> int:
             worker = Worker(engine, config, settings_loader=lambda: load_settings(args.profile),
                             telegram=telegram, profile_path=args.profile,
                             discover=discover if args.discover else None,
-                            heartbeat=record_progress)
+                            heartbeat=lambda: record_progress(worker.runtime_status()))
             for sig in (signal.SIGTERM, signal.SIGINT):
                 signal.signal(sig, lambda *_: worker.stop.set())
             worker.run(duration=args.duration)
+    except WorkerFailed as exc:
+        logging.getLogger(__name__).error("%s", exc)
+        exit_code = 1
     except ValueError as exc:
         print(exc, file=sys.stderr)
         return 2
     finally:
+        if worker is not None and worker.background_stuck:
+            # Python cannot cancel a blocked thread. Drop its DB sessions with
+            # the process; never leave it alive after releasing the cycle lock.
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(1)
         engine.dispose()
     import threading
     if any(t.is_alive() and not t.daemon for t in threading.enumerate() if t is not threading.main_thread()):
@@ -721,8 +749,8 @@ def cmd_worker(args) -> int:
         # open transaction rolls back when the connection drops.
         logging.shutdown()
         sys.stdout.flush()
-        os._exit(0)
-    return 0
+        os._exit(exit_code)
+    return exit_code
 
 
 def cmd_metrics(args) -> int:

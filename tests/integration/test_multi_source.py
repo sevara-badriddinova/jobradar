@@ -10,7 +10,8 @@ from sqlalchemy import select
 
 from jobradar import cli
 from jobradar.db import jobs as jobs_t
-from tests.factories import RecordingTransport, ashby_job, greenhouse_job, lever_posting
+from tests.factories import (RecordingTransport, recent_ashby_job as ashby_job,
+                             recent_greenhouse_job as greenhouse_job, lever_posting)
 
 
 class FakeATS:

@@ -141,7 +141,7 @@ def test_listener_recovers_after_database_disconnect(monkeypatch, caplog):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(cli, "_telegram_env", lambda: ("token", "chat"))
-    monkeypatch.setattr(cli, "make_engine", Engine)
+    monkeypatch.setattr(cli, "make_engine", lambda **kwargs: Engine())
     monkeypatch.setattr(cli, "process_updates", poll)
     monkeypatch.setattr(cli, "request_queue", lambda *args, **kwargs: None)
     monkeypatch.setattr(cli.time, "sleep", state["sleeps"].append)

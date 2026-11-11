@@ -7,13 +7,17 @@ import json
 import os
 from pathlib import Path
 import secrets
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 from contextlib import contextmanager
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+from recovery import CONTROL, atomic_json, low_load_backup
 
 PROJECT = "jobradar-510801"
 BUCKET = PROJECT + "-jobradar-health"
@@ -27,15 +31,12 @@ def progress(message):
 
 @contextmanager
 def maintenance_lock():
-    # Polling takes this same lock non-blockingly. Backups wait for a running
-    # cycle to finish, then keep disk-heavy polling out until upload completes.
-    with (DATA / "maintenance.lock").open("a") as lock:
-        progress("Waiting for the current polling cycle before backup")
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+    # Serialize backups with deploy/compaction, but share the worker lock.
+    # A legacy poll's exclusive lock makes backup skip, never stop the app.
+    with (DATA / "operations.lock").open("a") as operation, (DATA / "maintenance.lock").open("a") as lock:
+        fcntl.flock(operation, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        yield
 
 
 def file_digests(path):
@@ -89,6 +90,9 @@ def publish_backup_health(state):
                   "Content-Type": "application/json"}, method="POST")
     with urlopen(req, timeout=30) as response:
         json.load(response)
+    # Cleanup stays disabled until this exact release has a verified remote
+    # backup. Reboot clears /run; the next successful backup enables it again.
+    atomic_json(CONTROL / "backup.json", state)
 
 
 def token():
@@ -98,18 +102,56 @@ def token():
         return json.load(r)["access_token"]
 
 
-def secret(name, access_token):
-    req = Request(f"https://secretmanager.googleapis.com/v1/projects/{PROJECT}/secrets/{name}/versions/1:access",
+def numbered(version):
+    if not version.isascii() or not version.isdecimal() or version.startswith("0"):
+        raise ValueError("Expected a positive numeric secret version")
+    return version
+
+
+def anthropic_version():
+    try:
+        return numbered((ROOT / "anthropic-secret-version").read_text().strip())
+    except FileNotFoundError:
+        return "1"  # existing installations
+
+
+def secret(name, access_token, version="1"):
+    req = Request(f"https://secretmanager.googleapis.com/v1/projects/{PROJECT}/secrets/{name}/versions/{numbered(version)}:access",
                   headers={"Authorization": "Bearer " + access_token})
     with urlopen(req, timeout=30) as r:
         return base64.b64decode(json.load(r)["payload"]["data"]).decode()
 
 
 def secure_write(path, body):
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
-        f.write(body)
-    tmp.replace(path)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix="."+path.name+".")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(body)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def prepare_rotated_env(version, destination):
+    """Stage only the new key, before stopping any service; never print it."""
+    version = numbered(version)
+    value = secret("jobradar-anthropic-key", token(), version)
+    if not value or not value.isascii() or not all(33 <= ord(c) <= 126 for c in value) or any(c in value for c in "'$\\"):
+        raise ValueError("Invalid key format")
+    lines = (ROOT / "runtime.env").read_text().splitlines(keepends=True)
+    positions = [i for i, line in enumerate(lines) if line.startswith("ANTHROPIC_API_KEY=")]
+    if len(positions) != 1:
+        raise ValueError("Expected one Anthropic entry in the existing runtime settings")
+    # Authenticate without submitting a job, prompt, or inference request.
+    req = Request("https://api.anthropic.com/v1/models?limit=1",
+                  headers={"x-api-key": value, "anthropic-version": "2023-06-01"})
+    with urlopen(req, timeout=20) as response:
+        if not json.load(response).get("data"):
+            raise ValueError("New credential cannot list models")
+    lines[positions[0]] = f"ANTHROPIC_API_KEY='{value}'\n"
+    secure_write(destination, "".join(lines))
 
 
 def configure():
@@ -130,7 +172,7 @@ def configure():
     for key, name in {"ANTHROPIC_API_KEY": "jobradar-anthropic-key",
                       "TELEGRAM_BOT_TOKEN": "jobradar-telegram-token",
                       "TELEGRAM_CHAT_ID": "jobradar-telegram-chat-id"}.items():
-        value = secret(name, access_token)
+        value = secret(name, access_token, anthropic_version() if key == "ANTHROPIC_API_KEY" else "1")
         if any(c in value for c in "\r\n'$"):
             raise ValueError("Unexpected character in secret; refusing ambiguous env file")
         env[key] = value
@@ -146,18 +188,38 @@ def backup():
         started = time.monotonic()
         path = DATA / "backup.dump"
         partial = DATA / "backup.dump.partial"
-        progress("Backup dump started (compression level 1)")
-        with os.fdopen(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as stream:
-            subprocess.run(["docker", "compose", "exec", "-T", "postgres", "pg_dump",
-                            "-U", "jobradar", "-d", "jobradar", "-Fc", "-Z1",
-                            "--lock-wait-timeout=30s"], cwd=ROOT, stdout=stream, check=True, timeout=5400)
-            stream.flush()
-            os.fsync(stream.fileno())
-        progress(f"Dump finished: {partial.stat().st_size} bytes in {time.monotonic()-started:.1f}s")
-        # Read/decompress every archive entry, not just its table of contents.
-        with partial.open("rb") as stream:
-            subprocess.run(["docker", "compose", "exec", "-T", "postgres", "pg_restore",
-                            "--file=/dev/null"], cwd=ROOT, stdin=stream, check=True, timeout=1800)
+        with low_load_backup():
+            progress("Online backup started; heavy work drained, Telegram remains available")
+            with os.fdopen(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as stream:
+                # timeout runs INSIDE the container: killing the Docker client
+                # alone would leave pg_dump and its snapshot alive on the server.
+                try:
+                    subprocess.run(["docker", "compose", "exec", "-T", "postgres",
+                                    "timeout", "--kill-after=10s", "5400s", "env",
+                                    "PGAPPNAME=jobradar-online-backup",
+                                    "PGOPTIONS=-c statement_timeout=5400000", "pg_dump",
+                                    "-U", "jobradar", "-d", "jobradar", "-Fc", "-Z1",
+                                    "--lock-wait-timeout=30s"], cwd=ROOT, stdout=stream, check=True, timeout=5420)
+                except BaseException:
+                    # Host cancellation also terminates only this backup's DB
+                    # session. The in-container timeout is a second bound if
+                    # Docker itself is unresponsive or the host is killed.
+                    try:
+                        subprocess.run(["docker", "compose", "exec", "-T", "postgres", "psql",
+                            "-U", "jobradar", "-d", "jobradar", "-c",
+                            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                            "WHERE application_name = 'jobradar-online-backup' AND pid <> pg_backend_pid()"],
+                            cwd=ROOT, check=True, timeout=15, stdout=subprocess.DEVNULL)
+                    except Exception:
+                        progress("Backup cancellation unavailable; in-container deadline remains enforced")
+                    raise
+                stream.flush()
+                os.fsync(stream.fileno())
+            progress(f"Dump finished: {partial.stat().st_size} bytes in {time.monotonic()-started:.1f}s")
+            with partial.open("rb") as stream:
+                subprocess.run(["docker", "compose", "exec", "-T", "postgres",
+                                "timeout", "--kill-after=10s", "1800s", "pg_restore",
+                                "--file=/dev/null"], cwd=ROOT, stdin=stream, check=True, timeout=1820)
         partial.replace(path)
         progress("Archive stream verified; upload started")
         name = f"vm-backups/day-{datetime.datetime.now(datetime.UTC).weekday()}.dump"
@@ -170,8 +232,15 @@ def backup():
 
 
 if __name__ == "__main__":
+    def interrupted(signum, frame):
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
     try:
-        {"configure": configure, "backup": backup}[sys.argv[1]]()
+        if sys.argv[1] == "prepare-rotated-env" and len(sys.argv) == 4:
+            prepare_rotated_env(sys.argv[2], Path(sys.argv[3]))
+        else:
+            {"configure": configure, "backup": backup}[sys.argv[1]]()
     except Exception as exc:
         print("VM operation failed:", type(exc).__name__, file=sys.stderr)
         raise SystemExit(1)

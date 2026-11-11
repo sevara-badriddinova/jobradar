@@ -378,7 +378,8 @@ def make_engine(url: str | None = None, **pool_options) -> Engine:
     parsed = make_url(url)
     if parsed.drivername in {"postgres", "postgresql"}:
         parsed = parsed.set(drivername="postgresql+psycopg")
-    return create_engine(parsed, pool_pre_ping=True, connect_args={"connect_timeout": 30}, **pool_options)
+    connect_args = {"connect_timeout": 30, **pool_options.pop("connect_args", {})}
+    return create_engine(parsed, pool_pre_ping=True, connect_args=connect_args, **pool_options)
 
 
 def migrate(engine: Engine) -> None:

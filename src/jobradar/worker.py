@@ -35,6 +35,7 @@ from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from sqlalchemy import func, select, text, update
 from sqlalchemy.engine import Engine
@@ -53,11 +54,16 @@ from jobradar.notifications import enqueue as enqueue_notifications
 from jobradar.notifications import send_digest, send_immediate
 from jobradar.pipeline import run_collector
 from jobradar.settings import Settings
+from jobradar.runtime import atomic_json, maintenance, read_json, cleanup_permitted
 
 log = logging.getLogger(__name__)
 
 ALL_ROLES = frozenset({"schedule", "collect", "filter", "match", "notify"})
 MB = 1024 * 1024
+
+
+class WorkerFailed(RuntimeError):
+    """An essential thread exited or stopped making progress."""
 
 
 @dataclass
@@ -107,6 +113,12 @@ class WorkerConfig:
     keeper_interval: float = 60.0
     due_cache_seconds: float = 10.0
     shutdown_timeout: float = 90.0
+    supervisor_interval: float = 5.0
+    stall_timeout: float = 1200.0
+    collection_timeout: float = 1800.0
+    control_dir: str | None = None
+    cleanup_interval: float = 300.0
+    cleanup_enabled: bool = False
 
 
 class Worker:
@@ -151,6 +163,59 @@ class Worker:
         self._relevant_due: dict[str, float] = {}   # provider -> most overdue relevant board (epoch)
         self._claim_seq = 0                    # fair-claim rotation state
         self._last_served: dict[str, int] = {}
+        self.control_dir = Path(config.control_dir) if config.control_dir else None
+        self._stages: dict[str, dict] = {}
+        self._threads: list[threading.Thread] = []
+        self._collection_started: dict[int, float] = {}
+        self.background_stuck = False
+        self._fatal: str | None = None
+
+    def touch(self, state: str = "working") -> None:
+        name = threading.current_thread().name
+        with self._lock:
+            self._stages[name] = {"at": time.monotonic(), "state": state}
+
+    def low_load(self) -> dict:
+        return maintenance(self.control_dir)
+
+    def runtime_status(self) -> dict:
+        now = time.monotonic()
+        with self._lock:
+            stages = {t.name: {"alive": t.is_alive(),
+                              "stalled": now - self._stages[t.name]["at"] > self.cfg.stall_timeout,
+                              "age_seconds": round(now - self._stages[t.name]["at"], 1),
+                              "state": self._stages[t.name]["state"]}
+                      for t in self._threads}
+            active_collections = len(self._boards)
+            oldest = max((now - at for at in self._collection_started.values()), default=0)
+        mode = self.low_load()
+        heavy = ("collector", "filter", "match-", "maintenance")
+        quiesced = bool(stages) and all(
+            s["state"] == "maintenance" for name, s in stages.items()
+            if any(name.startswith(prefix) for prefix in heavy)) and active_collections == 0
+        return {"checked_at": time.time(), "owner": self.owner,
+                "state": "failed" if self._fatal else "stopping" if self.stop.is_set() else "running",
+                "stages": stages, "maintenance": mode,
+                "quiesced": bool(mode) and quiesced,
+                "oldest_collection_seconds": round(oldest, 1),
+                "collection_stalled": oldest > self.cfg.collection_timeout,
+                "matching_budget_paused": time.monotonic() < self._budget_recheck,
+                "listener": read_json(self.control_dir / "status/listener.json") if self.control_dir else None,
+                "match_fail_streak": self._match_fail_streak,
+                "notify_fail_streak": self._notify_fail_streak}
+
+    def supervise(self) -> None:
+        status = self.runtime_status()
+        failed = [name for name, s in status["stages"].items() if not s["alive"] or s["stalled"]]
+        if status["collection_stalled"]:
+            failed.append("collection deadline")
+        if failed:
+            self._fatal = "worker supervision failed: " + ", ".join(failed)
+            status["state"] = "failed"
+        if self.control_dir:
+            atomic_json(self.control_dir / "status" / "worker.json", status)
+        if self._fatal:
+            raise WorkerFailed(self._fatal)
 
     # --- small helpers ----------------------------------------------------------------
     def count(self, key: str, n: int = 1) -> None:
@@ -281,6 +346,8 @@ class Worker:
         def queue_filters(conn, report):
             report.queued = q.enqueue_pending_filters(conn, board.collector, board.board)
 
+        with self._lock:
+            self._collection_started[board.company_id] = time.monotonic()
         report, nbytes, outcome, pressured, error = None, None, "failed", False, None
         try:
             reserve = int((board.last_bytes or 0) * 1.25)
@@ -325,6 +392,7 @@ class Worker:
             with self._lock:
                 self._inflight[board.collector] -= 1
                 self._boards.pop(board.company_id, None)
+                self._collection_started.pop(board.company_id, None)
             self.wake["slot"].set()   # a provider slot opened: claim the next board now
         self.count(f"collect_{outcome}")
         if report is not None and report.unchanged:
@@ -343,11 +411,22 @@ class Worker:
         running: set[Future] = set()
         try:
             while not self.stop.is_set():
+                self.touch()
+                # Consume exceptions: an executor future must not silently hide
+                # a DB/finalization failure or a BaseException in a collector.
+                for future in running:
+                    if future.done():
+                        future.result()
                 running = {f for f in running if not f.done()}
+                if self.low_load():
+                    self.touch("maintenance")
+                    self.stop.wait(self.cfg.idle_sleep)
+                    continue
                 filter_n, match_n = self.backlog()
                 if filter_n > self.cfg.max_filter_backlog or (
                         self.cfg.max_match_backlog is not None and match_n > self.cfg.max_match_backlog):
                     self.count("collect_backpressure_pauses")
+                    self.touch("backpressure")
                     self.stop.wait(self.cfg.idle_sleep)
                     continue
                 free = self.cfg.collect_concurrency - len(running)
@@ -356,14 +435,22 @@ class Worker:
                 for b in boards:
                     running.add(pool.submit(self.collect_board, b))
                 if not boards:
+                    self.touch("waiting")
                     # Nothing claimable: all slots/providers busy or nothing due.
                     # A finishing collection wakes us immediately.
                     self.wake["slot"].wait(self.cfg.idle_sleep)
+        except BaseException:
+            # Publish failure before waiting for other executor tasks to drain.
+            # Otherwise one hung task could hide a different task's fatal exit.
+            self._fatal = "collector coordinator failed"
+            raise
         finally:
             pool.shutdown(wait=True, cancel_futures=False)
 
     # --- filtering ----------------------------------------------------------------------
     def filter_once(self) -> int:
+        if self.low_load():
+            return 0
         with self.engine.begin() as conn:
             tasks = q.claim(conn, "filter", self.owner, self.cfg.filter_batch, self.cfg.task_lease)
         if not tasks:
@@ -432,6 +519,8 @@ class Worker:
         return False
 
     def match_once(self) -> int:
+        if self.low_load():
+            return 0
         if self.budget_paused():
             return 0
         with self.engine.begin() as conn:
@@ -538,9 +627,11 @@ class Worker:
     def notify_loop(self) -> None:
         self._last["digest"] = time.monotonic()  # first digest after one interval, like before
         while not self.stop.is_set():
+            self.touch("waiting")
             self.wake["notify"].wait(15)
             self.wake["notify"].clear()
             try:
+                self.touch()
                 if self.settings.notifications.delivery != "alerts":
                     if self.due("legacy_notify", 120):  # the full legacy notify command
                         self.notify_once()
@@ -551,12 +642,19 @@ class Worker:
             except Exception:
                 log.exception("notification pass failed")
                 self.count("notify_errors")
+                self._notify_fail_streak += 1
+                self.touch("error")
                 self.stop.wait(30)
 
     # --- generic loops ------------------------------------------------------------------
     def stage_loop(self, name: str, step: Callable[[], int]) -> None:
         errors = 0
         while not self.stop.is_set():
+            if self.low_load():
+                self.touch("maintenance")
+                self.stop.wait(self.cfg.idle_sleep)
+                continue
+            self.touch()
             try:
                 done = step()
                 errors = 0
@@ -564,15 +662,21 @@ class Worker:
                 errors += 1
                 log.exception("%s loop error", name)
                 self.count(f"{name}_errors")
+                self.touch("error")
                 self.stop.wait(min(300, 5 * 2 ** min(errors, 6)))
                 continue
             if not done:
+                self.touch("budget_paused" if name == "match" and time.monotonic() < self._budget_recheck else "idle")
                 self.wake[name].wait(self.cfg.idle_sleep)
                 self.wake[name].clear()
 
     def keeper_loop(self) -> None:
         """Extend leases of work still in progress, so only crashed work expires."""
-        while not self.stop.wait(self.cfg.keeper_interval):
+        while not self.stop.is_set():
+            self.touch("waiting")
+            if self.stop.wait(self.cfg.keeper_interval):
+                break
+            self.touch()
             self.keep_leases()
 
     def keep_leases(self) -> None:
@@ -626,11 +730,12 @@ class Worker:
                 self.wake["match"].set()
         if force or self.due("metrics", self.cfg.metrics_interval):
             done["metrics"] = self.log_metrics()
-        if self.heartbeat and (force or self.due("heartbeat", self.cfg.heartbeat_interval)) and self.healthy():
-            try:
-                self.heartbeat()
-            except Exception:
-                log.exception("health heartbeat failed")
+        if (self.cfg.cleanup_enabled and cleanup_permitted(self.control_dir)
+                and self.due("cleanup", self.cfg.cleanup_interval)):
+            from jobradar.prune import prune_slice
+            # One bounded slice; a timeout rolls back and yields until next pass.
+            result = prune_slice(self.engine)
+            done["pruned"] = result.pruned
         return done
 
     def healthy(self) -> bool:
@@ -641,10 +746,12 @@ class Worker:
         from jobradar.metrics import snapshot
         with self.engine.connect() as conn:
             data = snapshot(conn)
+        # Never hold the supervision/counter lock across database I/O.
+        ai = {"spent_today_usd": round(self.meter.spent(), 4),
+              "daily_budget_usd": self.cfg.ai_daily_budget_usd,
+              "allowed_so_far_usd": self.meter.allowance()}
         with self._lock:
-            data["ai"] = {"spent_today_usd": round(self.meter.spent(), 4),
-                          "daily_budget_usd": self.cfg.ai_daily_budget_usd,
-                          "allowed_so_far_usd": self.meter.allowance()}
+            data["ai"] = ai
             data["worker"] = dict(self.counters, owner=self.owner, byte_budget_peak=self.budget.peak,
                                   rate_limit_wait_seconds=round(self.limiter.waited, 1))
         log.info("metrics %s", json.dumps(data, default=str, sort_keys=True))
@@ -656,12 +763,30 @@ class Worker:
 
     def maintenance_loop(self) -> None:
         while not self.stop.is_set():
+            if self.low_load():
+                self.touch("maintenance")
+                self.stop.wait(self.cfg.idle_sleep)
+                continue
+            self.touch()
             try:
                 self.maintain_once()
             except Exception:
                 log.exception("maintenance failed")
                 self.count("maintenance_errors")
+            self.touch("waiting")
             self.stop.wait(self.cfg.maintenance_interval)
+
+    def heartbeat_loop(self) -> None:
+        # Keep progress reporting out of expensive discovery, filters and metrics.
+        while not self.stop.is_set():
+            self.touch()
+            try:
+                if self.heartbeat:
+                    self.heartbeat()
+            except Exception:
+                log.exception("health heartbeat failed")
+            self.touch("waiting")
+            self.stop.wait(self.cfg.heartbeat_interval)
 
     # --- lifecycle ----------------------------------------------------------------------
     def run(self, duration: float | None = None) -> None:
@@ -684,11 +809,18 @@ class Worker:
                                          name=f"match-{i}", daemon=True) for i in range(self.cfg.match_concurrency)]
         if "notify" in roles:
             threads.append(threading.Thread(target=self.notify_loop, name="notify", daemon=True))
+        if self.heartbeat:
+            threads.append(threading.Thread(target=self.heartbeat_loop, name="heartbeat", daemon=True))
+        self._threads = threads
+        self._stages = {t.name: {"at": time.monotonic(), "state": "starting"} for t in threads}
         log.info("worker %s starting roles=%s", self.owner, sorted(roles))
         for t in threads:
             t.start()
         try:
-            self.stop.wait(duration)
+            end = time.monotonic() + duration if duration is not None else float("inf")
+            while not self.stop.is_set() and time.monotonic() < end:
+                self.supervise()
+                self.stop.wait(min(self.cfg.supervisor_interval, max(0, end - time.monotonic())))
         finally:
             self.stop.set()
             for event in self.wake.values():
@@ -700,7 +832,13 @@ class Worker:
             stuck = [t.name for t in threads if t.is_alive()]
             if stuck:
                 log.warning("threads still busy at shutdown (their leases will expire): %s", stuck)
-            with self.engine.begin() as conn:
-                released = q.release_owner(conn, self.owner)
+            self.background_stuck = bool(stuck)
+            # Never release leases while an abandoned thread can still write.
+            released = 0
+            if not stuck:
+                with self.engine.begin() as conn:
+                    released = q.release_owner(conn, self.owner)
+            if self.control_dir:
+                atomic_json(self.control_dir / "status" / "worker.json", self.runtime_status())
             log.info("worker %s stopped; released %d lease(s); counters %s",
                      self.owner, released, dict(self.counters))

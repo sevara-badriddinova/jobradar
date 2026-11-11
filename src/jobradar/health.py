@@ -14,6 +14,7 @@ from urllib.parse import quote
 import httpx
 
 from jobradar.telegram import Telegram, TelegramError
+from jobradar.runtime import status_ok
 
 log = logging.getLogger(__name__)
 STATE_OBJECT = "incident.json"
@@ -35,6 +36,30 @@ def diagnosis(executions, now, *, stale_minutes=30, last_progress=None):
     # Only the worker's end-of-pipeline heartbeat proves the app made progress.
     if not last_progress or now - timestamp(last_progress) > timedelta(minutes=stale_minutes):
         return f"No successful scan has completed in the last {stale_minutes} minutes. The worker or scheduler may be stalled."
+    return None
+
+
+def worker_diagnosis(progress, now):
+    # Older cycle heartbeats remain readable during a rolling deployment.
+    if not isinstance(progress, dict):
+        return diagnosis([], now, last_progress=progress)
+    runtime = progress.get("runtime", {})
+    if not isinstance(runtime, dict):
+        return "Worker health record is invalid; app health is unknown."
+    if not status_ok(runtime, now=now.timestamp(), max_age=1800):
+        return "Worker health is missing, stale, or a required stage is stopped or stalled."
+    if runtime.get("collection_stalled"):
+        return "A collection exceeded its execution deadline."
+    if runtime.get("listener") is not None:
+        listener = runtime["listener"]
+        if not 0 <= now.timestamp() - listener.get("checked_at", 0) <= 1800 or listener.get("error"):
+            return "Telegram listener is stale or reporting connection errors."
+    if runtime.get("notify_fail_streak", 0) >= 3:
+        return "Telegram notification delivery is repeatedly failing."
+    if runtime.get("match_fail_streak", 0) >= 3 and not runtime.get("matching_budget_paused"):
+        return "AI matching is repeatedly failing."
+    if any(s.get("state") == "error" for s in runtime.get("stages", {}).values()):
+        return "A pipeline stage is retrying errors; inspect worker logs."
     return None
 
 
@@ -88,10 +113,11 @@ class CloudHealth:
         return response.json()["generation"]
 
     def progress(self):
-        return self.read(state_object="progress.json")[0].get("completed_at")
+        value = self.read(state_object="progress.json")[0]
+        return value if "runtime" in value else value.get("completed_at")
 
 
-def record_progress():
+def record_progress(runtime=None):
     """Optional cloud heartbeat, called only after every requested stage finishes."""
     if not os.environ.get("JOBRADAR_HEALTH_BUCKET"):
         return
@@ -101,14 +127,17 @@ def record_progress():
             os.environ.get("JOBRADAR_POLL_JOB", "jobradar-poll"), os.environ["JOBRADAR_HEALTH_BUCKET"],
             state_object="progress.json")
         _, generation = cloud.read()
-        cloud.write({"completed_at": datetime.now(UTC).isoformat()}, generation)
+        cloud.write({"completed_at": datetime.now(UTC).isoformat(),
+                     **({"runtime": runtime} if runtime is not None else {})}, generation)
 
 
 def check(cloud, tg, chat_id, *, now=None, check_backups=False):
     now = now or datetime.now(UTC)
     previous, generation = cloud.read()
     try:
-        reason = diagnosis(cloud.executions(), now, last_progress=cloud.progress())
+        # The VM owns the pipeline. Retired Cloud Run executions are neither a
+        # prerequisite for monitoring nor evidence of current VM health.
+        reason = worker_diagnosis(cloud.progress(), now)
         if check_backups:
             backup_reason = backup_diagnosis(cloud.read(state_object="backup.json")[0], now)
             reason = " ".join(r for r in (reason, backup_reason) if r) or None

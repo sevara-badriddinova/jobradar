@@ -17,7 +17,7 @@ def scratch(database_url):
     name = "jobradar_migrations_test"
     with admin.connect() as conn:
         conn.execute(text(f"DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
-        conn.execute(text(f"CREATE DATABASE {name}"))
+        conn.execute(text(f"CREATE DATABASE {name} TEMPLATE template0 ENCODING 'UTF8'"))
     engine = create_engine(admin.url.set(database=name))
     yield engine
     engine.dispose()
