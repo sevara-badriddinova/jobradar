@@ -106,6 +106,47 @@ def prune_content(engine: Engine, *, min_age_days: int = 3, posted_before_days: 
     return result
 
 
+def prune_slice(engine: Engine, *, start_after: int | None = None, scan: int = 2000,
+                batch: int = 25, timeout_ms: int = 3000) -> PruneResult:
+    """One small online cleanup transaction, bounded in rows and statement time.
+
+    Walk a primary-key window even when no rows qualify; never scan the whole
+    table looking for 25 eligible rows. Wrap at EOF so skipped locks and newly
+    aged rows are revisited. Timeout rolls back the entire slice.
+    """
+    if not (1 <= batch <= 100 and 1 <= scan <= 2000 and 1 <= timeout_ms <= 10000):
+        raise ValueError("cleanup bounds exceeded")
+    with engine.begin() as conn:
+        conn.execute(text("SELECT set_config('statement_timeout', :v, true)"), {"v": str(timeout_ms)})
+        conn.execute(text("SET LOCAL lock_timeout = '100ms'"))
+        # Coordinate concurrent cleanup attempts without ever waiting.
+        if not conn.execute(text("SELECT pg_try_advisory_xact_lock(741903116)" )).scalar_one():
+            return PruneResult(last_id=start_after or 0)
+        persist = start_after is None
+        if persist:
+            start_after = int(conn.execute(text("SELECT value FROM app_state WHERE key = 'cleanup_cursor'")).scalar() or 0)
+        def save_cursor(cursor):
+            if persist:
+                conn.execute(text("INSERT INTO app_state (key,value) VALUES ('cleanup_cursor',:v) "
+                                  "ON CONFLICT (key) DO UPDATE SET value=excluded.value"), {"v": str(cursor)})
+        window = conn.execute(select(jobs.c.id).where(jobs.c.id > start_after)
+                              .order_by(jobs.c.id).limit(scan)).scalars().all()
+        if not window:
+            save_cursor(0)
+            return PruneResult(last_id=0)
+        ids = conn.execute(select(jobs.c.id).where(
+            jobs.c.id > start_after, jobs.c.id <= window[-1],
+            prunable(min_age_days=3, posted_before_days=14))
+            .order_by(jobs.c.id).limit(batch).with_for_update(skip_locked=True)).scalars().all()
+        if ids:
+            conn.execute(update(jobs).where(jobs.c.id.in_(ids)).values(
+                raw_digest=_digest_by_source(), raw=cast(literal("{}"), JSONB), description=""))
+        # Do not skip the remainder of a densely eligible window.
+        cursor = ids[-1] if len(ids) == batch else window[-1]
+        save_cursor(cursor)
+    return PruneResult(pruned=len(ids), batches=1, last_id=cursor)
+
+
 @dataclass
 class RewriteResult:
     before_bytes: int

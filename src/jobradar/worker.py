@@ -24,6 +24,7 @@ application history, and existing filter behaviour are unchanged.
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import logging
 import os
@@ -35,6 +36,7 @@ from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from sqlalchemy import func, select, text, update
 from sqlalchemy.engine import Engine
@@ -53,11 +55,26 @@ from jobradar.notifications import enqueue as enqueue_notifications
 from jobradar.notifications import send_digest, send_immediate
 from jobradar.pipeline import run_collector
 from jobradar.settings import Settings
+from jobradar.runtime import atomic_json, maintenance, read_json, cleanup_permitted
 
 log = logging.getLogger(__name__)
 
 ALL_ROLES = frozenset({"schedule", "collect", "filter", "match", "notify"})
 MB = 1024 * 1024
+# app_state row that exists while a "scoring is down" alert is open. Claiming it
+# makes the alert once-only across restarts and parallel workers; deleting it
+# sends the single recovery message.
+SCORING_ALERT_KEY = "scoring_down_alert"
+SCORING_DOWN_TEXT = ("⚠️ <b>JobRadar: AI scoring is down</b>\n"
+                     "The AI provider rejected the account ({reason}). New jobs stay queued without "
+                     "using up retries, and scoring resumes on its own once the key works.\n"
+                     "Fix: add a new version of <code>jobradar-anthropic-key</code> in Secret Manager "
+                     "and point the VM at it.")
+SCORING_BACK_TEXT = "✅ <b>JobRadar: AI scoring is working again.</b> Queued jobs are being scored now."
+
+
+class WorkerFailed(RuntimeError):
+    """An essential thread exited or stopped making progress."""
 
 
 @dataclass
@@ -79,6 +96,9 @@ class WorkerConfig:
     filter_batch: int = 200
     match_batch: int = 4
     match_max_attempts: int = 12           # ~1 day of backoff during an LLM outage
+    # A rejected API key pauses matching (no attempts charged) and is retried
+    # with one batch this often; a 401 costs nothing.
+    auth_recheck_interval: float = 600.0
     max_filter_backlog: int = 20000        # backpressure: pause collection above this
     max_match_backlog: int | None = None   # matching never blocks discovery by default
     match_concurrency: int = 2
@@ -107,6 +127,12 @@ class WorkerConfig:
     keeper_interval: float = 60.0
     due_cache_seconds: float = 10.0
     shutdown_timeout: float = 90.0
+    supervisor_interval: float = 5.0
+    stall_timeout: float = 1200.0
+    collection_timeout: float = 1800.0
+    control_dir: str | None = None
+    cleanup_interval: float = 300.0
+    cleanup_enabled: bool = False
 
 
 class Worker:
@@ -130,6 +156,9 @@ class Worker:
         self.meter = DailyBudgetMeter(engine, config.ai_daily_budget_usd, paced=config.ai_budget_paced)
         llm.set_meter(self.meter)
         self._budget_recheck = 0.0
+        self._auth_recheck = 0.0               # matching paused until (monotonic) after a rejected key
+        self._auth_reason: str | None = None
+        self._scoring_alert_checked = False    # an alert may be open from a previous process
         self.profile_path = profile_path
         self.discover, self.heartbeat = discover, heartbeat
         self.owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:6]}"
@@ -151,6 +180,60 @@ class Worker:
         self._relevant_due: dict[str, float] = {}   # provider -> most overdue relevant board (epoch)
         self._claim_seq = 0                    # fair-claim rotation state
         self._last_served: dict[str, int] = {}
+        self.control_dir = Path(config.control_dir) if config.control_dir else None
+        self._stages: dict[str, dict] = {}
+        self._threads: list[threading.Thread] = []
+        self._collection_started: dict[int, float] = {}
+        self.background_stuck = False
+        self._fatal: str | None = None
+
+    def touch(self, state: str = "working") -> None:
+        name = threading.current_thread().name
+        with self._lock:
+            self._stages[name] = {"at": time.monotonic(), "state": state}
+
+    def low_load(self) -> dict:
+        return maintenance(self.control_dir)
+
+    def runtime_status(self) -> dict:
+        now = time.monotonic()
+        with self._lock:
+            stages = {t.name: {"alive": t.is_alive(),
+                              "stalled": now - self._stages[t.name]["at"] > self.cfg.stall_timeout,
+                              "age_seconds": round(now - self._stages[t.name]["at"], 1),
+                              "state": self._stages[t.name]["state"]}
+                      for t in self._threads}
+            active_collections = len(self._boards)
+            oldest = max((now - at for at in self._collection_started.values()), default=0)
+        mode = self.low_load()
+        heavy = ("collector", "filter", "match-", "maintenance")
+        quiesced = bool(stages) and all(
+            s["state"] == "maintenance" for name, s in stages.items()
+            if any(name.startswith(prefix) for prefix in heavy)) and active_collections == 0
+        return {"checked_at": time.time(), "owner": self.owner,
+                "state": "failed" if self._fatal else "stopping" if self.stop.is_set() else "running",
+                "stages": stages, "maintenance": mode,
+                "quiesced": bool(mode) and quiesced,
+                "oldest_collection_seconds": round(oldest, 1),
+                "collection_stalled": oldest > self.cfg.collection_timeout,
+                "matching_budget_paused": time.monotonic() < self._budget_recheck,
+                "matching_auth_paused": self.auth_paused(),
+                "listener": read_json(self.control_dir / "status/listener.json") if self.control_dir else None,
+                "match_fail_streak": self._match_fail_streak,
+                "notify_fail_streak": self._notify_fail_streak}
+
+    def supervise(self) -> None:
+        status = self.runtime_status()
+        failed = [name for name, s in status["stages"].items() if not s["alive"] or s["stalled"]]
+        if status["collection_stalled"]:
+            failed.append("collection deadline")
+        if failed:
+            self._fatal = "worker supervision failed: " + ", ".join(failed)
+            status["state"] = "failed"
+        if self.control_dir:
+            atomic_json(self.control_dir / "status" / "worker.json", status)
+        if self._fatal:
+            raise WorkerFailed(self._fatal)
 
     # --- small helpers ----------------------------------------------------------------
     def count(self, key: str, n: int = 1) -> None:
@@ -281,6 +364,8 @@ class Worker:
         def queue_filters(conn, report):
             report.queued = q.enqueue_pending_filters(conn, board.collector, board.board)
 
+        with self._lock:
+            self._collection_started[board.company_id] = time.monotonic()
         report, nbytes, outcome, pressured, error = None, None, "failed", False, None
         try:
             reserve = int((board.last_bytes or 0) * 1.25)
@@ -325,6 +410,7 @@ class Worker:
             with self._lock:
                 self._inflight[board.collector] -= 1
                 self._boards.pop(board.company_id, None)
+                self._collection_started.pop(board.company_id, None)
             self.wake["slot"].set()   # a provider slot opened: claim the next board now
         self.count(f"collect_{outcome}")
         if report is not None and report.unchanged:
@@ -343,11 +429,22 @@ class Worker:
         running: set[Future] = set()
         try:
             while not self.stop.is_set():
+                self.touch()
+                # Consume exceptions: an executor future must not silently hide
+                # a DB/finalization failure or a BaseException in a collector.
+                for future in running:
+                    if future.done():
+                        future.result()
                 running = {f for f in running if not f.done()}
+                if self.low_load():
+                    self.touch("maintenance")
+                    self.stop.wait(self.cfg.idle_sleep)
+                    continue
                 filter_n, match_n = self.backlog()
                 if filter_n > self.cfg.max_filter_backlog or (
                         self.cfg.max_match_backlog is not None and match_n > self.cfg.max_match_backlog):
                     self.count("collect_backpressure_pauses")
+                    self.touch("backpressure")
                     self.stop.wait(self.cfg.idle_sleep)
                     continue
                 free = self.cfg.collect_concurrency - len(running)
@@ -356,14 +453,22 @@ class Worker:
                 for b in boards:
                     running.add(pool.submit(self.collect_board, b))
                 if not boards:
+                    self.touch("waiting")
                     # Nothing claimable: all slots/providers busy or nothing due.
                     # A finishing collection wakes us immediately.
                     self.wake["slot"].wait(self.cfg.idle_sleep)
+        except BaseException:
+            # Publish failure before waiting for other executor tasks to drain.
+            # Otherwise one hung task could hide a different task's fatal exit.
+            self._fatal = "collector coordinator failed"
+            raise
         finally:
             pool.shutdown(wait=True, cancel_futures=False)
 
     # --- filtering ----------------------------------------------------------------------
     def filter_once(self) -> int:
+        if self.low_load():
+            return 0
         with self.engine.begin() as conn:
             tasks = q.claim(conn, "filter", self.owner, self.cfg.filter_batch, self.cfg.task_lease)
         if not tasks:
@@ -431,8 +536,49 @@ class Worker:
             return True
         return False
 
+    def auth_paused(self) -> bool:
+        """True while the AI provider is rejecting our credentials. Tasks stay queued."""
+        return time.monotonic() < self._auth_recheck
+
+    def _scoring_alert(self, reason: str | None) -> None:
+        """Send one Telegram message when scoring goes down (reason) and one when
+        it recovers (None). The open alert lives in app_state, so a restart or a
+        second worker never repeats either message. Never raises."""
+        if self.telegram is None:
+            return
+        tg, chat_id = self.telegram
+        try:
+            with self.engine.begin() as conn:
+                if reason is not None:
+                    claimed = conn.execute(text("""INSERT INTO app_state (key, value) VALUES (:k, :v)
+                        ON CONFLICT (key) DO NOTHING RETURNING key"""),
+                        {"k": SCORING_ALERT_KEY, "v": json.dumps(
+                            {"since": time.time(), "reason": reason})}).first()
+                else:
+                    claimed = conn.execute(text("DELETE FROM app_state WHERE key = :k RETURNING key"),
+                                           {"k": SCORING_ALERT_KEY}).first()
+        except Exception:
+            log.exception("could not record the scoring alert state")
+            return
+        if claimed is None:
+            return  # already alerted (down), or nothing was open (recovery)
+        message = (SCORING_DOWN_TEXT.format(reason=html.escape(reason)) if reason is not None
+                   else SCORING_BACK_TEXT)
+        try:
+            tg.send_message(chat_id, message)
+            self.count("scoring_alerts_sent")
+        except Exception as exc:
+            log.warning("scoring %s alert not sent: %s", "down" if reason else "recovery", exc)
+            if reason is not None and not getattr(exc, "maybe_delivered", False):
+                with self.engine.begin() as conn:  # certainly not delivered: the next pause retries
+                    conn.execute(text("DELETE FROM app_state WHERE key = :k"), {"k": SCORING_ALERT_KEY})
+
     def match_once(self) -> int:
+        if self.low_load():
+            return 0
         if self.budget_paused():
+            return 0
+        if self.auth_paused():
             return 0
         with self.engine.begin() as conn:
             tasks = q.claim(conn, "match", self.owner, self.cfg.match_batch, self.cfg.task_lease)
@@ -461,6 +607,21 @@ class Worker:
             self.count("match_budget_pauses")
             log.warning("%s; %d match task(s) kept queued", exc, len(tasks))
             return 0
+        except llm.CredentialsRejected as exc:
+            # The key/account is refused: no job is at fault. Keep every task
+            # (no attempt charged), pause, alert once, and retry one batch later.
+            interval = self.cfg.auth_recheck_interval
+            with self.engine.begin() as conn:
+                q.release(conn, tasks, self.owner, delay=interval)
+            self._auth_recheck = time.monotonic() + interval
+            first = self._auth_reason is None
+            self._auth_reason = exc.reason
+            self.count("match_auth_pauses")
+            log.error("AI provider rejected the credentials (%s); matching paused for %d min, "
+                      "%d match task(s) kept queued", exc.reason, interval // 60, len(tasks))
+            if first:
+                self._scoring_alert(exc.reason)
+            return 0
         except Exception as exc:
             log.exception("match batch crashed")
             with self.engine.begin() as conn:
@@ -486,6 +647,12 @@ class Worker:
         self.count("match_done", len(tasks) - len(failed))
         self.count("match_failed", len(failed))
         self._match_fail_streak = self._match_fail_streak + 1 if failed and len(failed) == len(attempted) else 0
+        if result.assessed and (self._auth_reason is not None or not self._scoring_alert_checked):
+            # A real model call succeeded: close any open "scoring is down" alert,
+            # including one left open by a previous process.
+            self._auth_reason = None
+            self._scoring_alert_checked = True
+            self._scoring_alert(None)
         if queued:
             self.wake["notify"].set()
         return len(tasks)
@@ -538,9 +705,11 @@ class Worker:
     def notify_loop(self) -> None:
         self._last["digest"] = time.monotonic()  # first digest after one interval, like before
         while not self.stop.is_set():
+            self.touch("waiting")
             self.wake["notify"].wait(15)
             self.wake["notify"].clear()
             try:
+                self.touch()
                 if self.settings.notifications.delivery != "alerts":
                     if self.due("legacy_notify", 120):  # the full legacy notify command
                         self.notify_once()
@@ -551,12 +720,19 @@ class Worker:
             except Exception:
                 log.exception("notification pass failed")
                 self.count("notify_errors")
+                self._notify_fail_streak += 1
+                self.touch("error")
                 self.stop.wait(30)
 
     # --- generic loops ------------------------------------------------------------------
     def stage_loop(self, name: str, step: Callable[[], int]) -> None:
         errors = 0
         while not self.stop.is_set():
+            if self.low_load():
+                self.touch("maintenance")
+                self.stop.wait(self.cfg.idle_sleep)
+                continue
+            self.touch()
             try:
                 done = step()
                 errors = 0
@@ -564,15 +740,23 @@ class Worker:
                 errors += 1
                 log.exception("%s loop error", name)
                 self.count(f"{name}_errors")
+                self.touch("error")
                 self.stop.wait(min(300, 5 * 2 ** min(errors, 6)))
                 continue
             if not done:
+                paused = ("budget_paused" if time.monotonic() < self._budget_recheck
+                          else "auth_paused" if self.auth_paused() else None) if name == "match" else None
+                self.touch(paused or "idle")
                 self.wake[name].wait(self.cfg.idle_sleep)
                 self.wake[name].clear()
 
     def keeper_loop(self) -> None:
         """Extend leases of work still in progress, so only crashed work expires."""
-        while not self.stop.wait(self.cfg.keeper_interval):
+        while not self.stop.is_set():
+            self.touch("waiting")
+            if self.stop.wait(self.cfg.keeper_interval):
+                break
+            self.touch()
             self.keep_leases()
 
     def keep_leases(self) -> None:
@@ -626,11 +810,12 @@ class Worker:
                 self.wake["match"].set()
         if force or self.due("metrics", self.cfg.metrics_interval):
             done["metrics"] = self.log_metrics()
-        if self.heartbeat and (force or self.due("heartbeat", self.cfg.heartbeat_interval)) and self.healthy():
-            try:
-                self.heartbeat()
-            except Exception:
-                log.exception("health heartbeat failed")
+        if (self.cfg.cleanup_enabled and cleanup_permitted(self.control_dir)
+                and self.due("cleanup", self.cfg.cleanup_interval)):
+            from jobradar.prune import prune_slice
+            # One bounded slice; a timeout rolls back and yields until next pass.
+            result = prune_slice(self.engine)
+            done["pruned"] = result.pruned
         return done
 
     def healthy(self) -> bool:
@@ -641,10 +826,13 @@ class Worker:
         from jobradar.metrics import snapshot
         with self.engine.connect() as conn:
             data = snapshot(conn)
+        # Never hold the supervision/counter lock across database I/O.
+        ai = {"spent_today_usd": round(self.meter.spent(), 4),
+              "daily_budget_usd": self.cfg.ai_daily_budget_usd,
+              "allowed_so_far_usd": self.meter.allowance(),
+              "auth_paused": self.auth_paused(), "auth_error": self._auth_reason}
         with self._lock:
-            data["ai"] = {"spent_today_usd": round(self.meter.spent(), 4),
-                          "daily_budget_usd": self.cfg.ai_daily_budget_usd,
-                          "allowed_so_far_usd": self.meter.allowance()}
+            data["ai"] = ai
             data["worker"] = dict(self.counters, owner=self.owner, byte_budget_peak=self.budget.peak,
                                   rate_limit_wait_seconds=round(self.limiter.waited, 1))
         log.info("metrics %s", json.dumps(data, default=str, sort_keys=True))
@@ -656,12 +844,30 @@ class Worker:
 
     def maintenance_loop(self) -> None:
         while not self.stop.is_set():
+            if self.low_load():
+                self.touch("maintenance")
+                self.stop.wait(self.cfg.idle_sleep)
+                continue
+            self.touch()
             try:
                 self.maintain_once()
             except Exception:
                 log.exception("maintenance failed")
                 self.count("maintenance_errors")
+            self.touch("waiting")
             self.stop.wait(self.cfg.maintenance_interval)
+
+    def heartbeat_loop(self) -> None:
+        # Keep progress reporting out of expensive discovery, filters and metrics.
+        while not self.stop.is_set():
+            self.touch()
+            try:
+                if self.heartbeat:
+                    self.heartbeat()
+            except Exception:
+                log.exception("health heartbeat failed")
+            self.touch("waiting")
+            self.stop.wait(self.cfg.heartbeat_interval)
 
     # --- lifecycle ----------------------------------------------------------------------
     def run(self, duration: float | None = None) -> None:
@@ -684,11 +890,18 @@ class Worker:
                                          name=f"match-{i}", daemon=True) for i in range(self.cfg.match_concurrency)]
         if "notify" in roles:
             threads.append(threading.Thread(target=self.notify_loop, name="notify", daemon=True))
+        if self.heartbeat:
+            threads.append(threading.Thread(target=self.heartbeat_loop, name="heartbeat", daemon=True))
+        self._threads = threads
+        self._stages = {t.name: {"at": time.monotonic(), "state": "starting"} for t in threads}
         log.info("worker %s starting roles=%s", self.owner, sorted(roles))
         for t in threads:
             t.start()
         try:
-            self.stop.wait(duration)
+            end = time.monotonic() + duration if duration is not None else float("inf")
+            while not self.stop.is_set() and time.monotonic() < end:
+                self.supervise()
+                self.stop.wait(min(self.cfg.supervisor_interval, max(0, end - time.monotonic())))
         finally:
             self.stop.set()
             for event in self.wake.values():
@@ -700,7 +913,13 @@ class Worker:
             stuck = [t.name for t in threads if t.is_alive()]
             if stuck:
                 log.warning("threads still busy at shutdown (their leases will expire): %s", stuck)
-            with self.engine.begin() as conn:
-                released = q.release_owner(conn, self.owner)
+            self.background_stuck = bool(stuck)
+            # Never release leases while an abandoned thread can still write.
+            released = 0
+            if not stuck:
+                with self.engine.begin() as conn:
+                    released = q.release_owner(conn, self.owner)
+            if self.control_dir:
+                atomic_json(self.control_dir / "status" / "worker.json", self.runtime_status())
             log.info("worker %s stopped; released %d lease(s); counters %s",
                      self.owner, released, dict(self.counters))

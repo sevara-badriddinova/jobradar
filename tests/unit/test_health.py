@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 
-from jobradar.health import CloudHealth, backup_diagnosis, check, diagnosis
+from jobradar.health import CloudHealth, backup_diagnosis, check, diagnosis, worker_diagnosis
 from jobradar.telegram import TelegramError
 
 NOW = datetime(2026, 10, 14, 14, tzinfo=UTC)
@@ -113,3 +113,32 @@ def test_gcs_generation_preconditions_and_no_database_access():
         assert cloud.read() == ({}, "0")
         assert cloud.write({"status": "down"}, "0") is None
     assert len(requests) == 3
+
+
+def test_vm_watchdog_does_not_read_retired_cloud_run_executions():
+    cloud, tg = FakeCloud(), FakeTelegram()
+    cloud.heartbeat = NOW.isoformat()
+    cloud.executions = lambda: pytest.fail("retired Cloud Run must not be queried")
+    assert check(cloud, tg, "42", now=NOW) == 0
+    assert not tg.messages
+
+
+def test_stage_health_distinguishes_budget_idle_maintenance_and_real_failures():
+    runtime = dict(checked_at=NOW.timestamp(), state="running", matching_budget_paused=True,
+                   stages={"match-0": {"alive": True, "stalled": False, "state": "budget_paused"}})
+    assert worker_diagnosis({"runtime": runtime}, NOW) is None
+    runtime["stages"]["match-0"]["state"] = "maintenance"
+    assert worker_diagnosis({"runtime": runtime}, NOW) is None
+    runtime["stages"]["match-0"]["stalled"] = True
+    assert worker_diagnosis({"runtime": runtime}, NOW)
+    runtime["stages"]["match-0"]["stalled"] = False
+    runtime["notify_fail_streak"] = 3
+    assert "delivery" in worker_diagnosis({"runtime": runtime}, NOW)
+
+
+def test_rejected_api_key_is_reported_by_name():
+    runtime = dict(checked_at=NOW.timestamp(), state="running", matching_auth_paused=True,
+                   stages={"match-0": {"alive": True, "stalled": False, "state": "auth_paused"}})
+    assert "rejecting the API key" in worker_diagnosis({"runtime": runtime}, NOW)
+    runtime["matching_auth_paused"] = False
+    assert worker_diagnosis({"runtime": runtime}, NOW) is None

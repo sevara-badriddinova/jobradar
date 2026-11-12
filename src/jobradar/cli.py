@@ -29,8 +29,9 @@ import sys
 import httpx
 import time
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import OperationalError
 
@@ -253,6 +254,10 @@ def cmd_match(args) -> int:
     except llm.BudgetExceeded as exc:
         print(f"{exc}; remaining jobs stay queued for tomorrow", file=sys.stderr)
         return 0
+    except llm.CredentialsRejected as exc:
+        print(f"the AI provider rejected the credentials ({exc.reason}); no job was marked failed",
+              file=sys.stderr)
+        return 2
     print(f"assessed {result.assessed}, reused {result.cached} cached, failed {result.failed}")
     if result.aborted:
         print("stopped early after repeated failures (see the errors above)", file=sys.stderr)
@@ -492,10 +497,20 @@ def cmd_telegram_setup(args) -> int:
 
 
 def cmd_telegram_listen(args) -> int:
+    from jobradar.runtime import atomic_json
     if (env := _telegram_env()) is None:
         return 2
     token, chat_id = env
-    engine = make_engine()
+    engine = make_engine(connect_args={"options": "-c statement_timeout=60000 -c lock_timeout=5000"})
+    control = os.environ.get("JOBRADAR_CONTROL_DIR")
+    last_status = 0.0
+
+    def listener_status(error=None):
+        nonlocal last_status
+        if control and time.monotonic() - last_status >= 5:
+            atomic_json(Path(control) / "status/listener.json",
+                        {"checked_at": time.time(), "state": "running", "error": error})
+            last_status = time.monotonic()
     try:
         settings = load_settings(args.profile)
     except SettingsError as exc:
@@ -518,10 +533,13 @@ def cmd_telegram_listen(args) -> int:
                         print(f"applied {pressed} button press(es)")
                     else:
                         time.sleep(1)  # another listener may own the update-consumer lock
+                    listener_status()
                 except TelegramError as exc:
+                    listener_status("Telegram unavailable")
                     logging.getLogger(__name__).warning("telegram: %s; retrying in 1s", exc)
                     time.sleep(1)
                 except OperationalError:
+                    listener_status("Database unavailable")
                     # A sleeping database or dropped connection must not kill
                     # live buttons. Do not log URLs, SQL parameters, or secrets.
                     logging.getLogger(__name__).warning("database unavailable; retrying in 5s")
@@ -667,7 +685,7 @@ def cmd_worker(args) -> int:
 
     from jobradar.cycle import cycle_lock
     from jobradar.health import record_progress
-    from jobradar.worker import ALL_ROLES, Worker, WorkerConfig
+    from jobradar.worker import ALL_ROLES, Worker, WorkerConfig, WorkerFailed
 
     roles = frozenset(r.strip() for r in args.roles.split(",") if r.strip())
     if not roles <= ALL_ROLES:
@@ -689,13 +707,18 @@ def cmd_worker(args) -> int:
     config = WorkerConfig(roles=roles, collect_concurrency=args.collect_concurrency,
                           base_interval=args.base_interval_minutes * 60,
                           byte_budget=args.byte_budget_mb * 1024 * 1024,
-                          ai_daily_budget_usd=budget, ai_budget_paced=pacing_from_env())
+                          ai_daily_budget_usd=budget, ai_budget_paced=pacing_from_env(),
+                          control_dir=os.environ.get("JOBRADAR_CONTROL_DIR"),
+                          cleanup_enabled=os.environ.get("JOBRADAR_ONLINE_CLEANUP") == "1")
     pool = config.collect_concurrency + 4
-    engine = make_engine(pool_size=pool, max_overflow=2, pool_timeout=60)
+    engine = make_engine(pool_size=pool, max_overflow=2, pool_timeout=30,
+                         connect_args={"options": "-c statement_timeout=300000 -c lock_timeout=10000 "
+                                      "-c idle_in_transaction_session_timeout=60000"})
 
     def discover():
         main(["--profile", args.profile, "companies", "discover"])
 
+    worker, exit_code = None, 0
     try:
         # Mutual exclusion with the legacy cycle: hold its lock for our lifetime.
         with cycle_lock(engine) as acquired:
@@ -705,14 +728,23 @@ def cmd_worker(args) -> int:
             worker = Worker(engine, config, settings_loader=lambda: load_settings(args.profile),
                             telegram=telegram, profile_path=args.profile,
                             discover=discover if args.discover else None,
-                            heartbeat=record_progress)
+                            heartbeat=lambda: record_progress(worker.runtime_status()))
             for sig in (signal.SIGTERM, signal.SIGINT):
                 signal.signal(sig, lambda *_: worker.stop.set())
             worker.run(duration=args.duration)
+    except WorkerFailed as exc:
+        logging.getLogger(__name__).error("%s", exc)
+        exit_code = 1
     except ValueError as exc:
         print(exc, file=sys.stderr)
         return 2
     finally:
+        if worker is not None and worker.background_stuck:
+            # Python cannot cancel a blocked thread. Drop its DB sessions with
+            # the process; never leave it alive after releasing the cycle lock.
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(1)
         engine.dispose()
     import threading
     if any(t.is_alive() and not t.daemon for t in threading.enumerate() if t is not threading.main_thread()):
@@ -721,8 +753,8 @@ def cmd_worker(args) -> int:
         # open transaction rolls back when the connection drops.
         logging.shutdown()
         sys.stdout.flush()
-        os._exit(0)
-    return 0
+        os._exit(exit_code)
+    return exit_code
 
 
 def cmd_metrics(args) -> int:
@@ -735,6 +767,11 @@ def cmd_metrics(args) -> int:
 def cmd_requeue(args) -> int:
     """Explicitly re-run a stage for some jobs, or make boards due now."""
     from jobradar import queue
+    if args.dead:
+        return requeue_dead_matches(args)
+    if args.dry_run:
+        print("--dry-run is only supported with --dead", file=sys.stderr)
+        return 2
     with make_engine().begin() as conn:
         if args.stage == "boards":
             n = queue.requeue_boards(conn, args.targets or None)
@@ -750,6 +787,37 @@ def cmd_requeue(args) -> int:
                 jobs.c.status.in_(["DISCOVERED", "REPOSTED"]), jobs.c.filtered_at.is_not(None))).scalars().all()
         n = queue.enqueue(conn, args.stage, ids, priority=50)
     print(f"{n} {args.stage} task(s) queued")
+    return 0
+
+
+def requeue_dead_matches(args) -> int:
+    """Revive dead match tasks whose jobs could still be scored and alerted:
+    open, past the filters, not reviewed, and inside the freshness window.
+    Older ones stay dead; matching would skip them anyway."""
+    from jobradar import queue
+    from jobradar.db import work_queue
+    from jobradar.recency import recent_jobs
+    if args.stage != "match" or args.targets:
+        print("--dead applies to the match stage only, without job ids", file=sys.stderr)
+        return 2
+    try:
+        filters = load_settings(args.profile).filters
+    except SettingsError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    dead = (work_queue.c.kind == "match") & (work_queue.c.state == "dead")
+    with make_engine().begin() as conn:
+        total = conn.execute(select(func.count()).select_from(work_queue).where(dead)).scalar_one()
+        ids = conn.execute(select(work_queue.c.job_id).join(jobs, jobs.c.id == work_queue.c.job_id).where(
+            dead, jobs.c.status.in_(["DISCOVERED", "REPOSTED"]), jobs.c.filtered_at.is_not(None),
+            jobs.c.closed_at.is_(None), not_skipped(),
+            recent_jobs(filters.max_posting_age_days, discovery_days=filters.max_discovery_age_days),
+        )).scalars().all()
+        if not args.dry_run:
+            queue.enqueue(conn, "match", ids, priority=50)
+    verb = "would requeue" if args.dry_run else "requeued"
+    print(f"{verb} {len(ids)} of {total} dead match task(s); the rest are too old, closed, "
+          f"reviewed or already scored")
     return 0
 
 
@@ -821,6 +889,9 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("requeue", help="explicitly queue jobs for a stage, or make boards due now")
     p.add_argument("stage", choices=["filter", "match", "boards"])
     p.add_argument("targets", nargs="*", help="job ids (filter/match) or board/company names (boards)")
+    p.add_argument("--dead", action="store_true",
+                   help="match only: revive dead tasks whose jobs are still fresh and eligible")
+    p.add_argument("--dry-run", action="store_true", help="with --dead: count, change nothing")
     p.set_defaults(func=cmd_requeue)
 
     p = sub.add_parser("cycle", help="run one scheduled collection/filter cycle, then exit")

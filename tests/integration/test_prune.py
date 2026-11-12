@@ -9,7 +9,7 @@ from sqlalchemy import func, select, text, update
 from jobradar import dedup
 from jobradar.db import jobs as jobs_t
 from jobradar.filters import PRUNED_REASON, run_filters
-from jobradar.prune import prune_content
+from jobradar.prune import prune_content, prune_slice
 from jobradar.settings import FilterSettings
 from jobradar.sponsorship_review import UNKNOWN_REASON
 from tests.factories import make_job
@@ -36,6 +36,51 @@ def age(engine, sid, *, days, status="FILTERED", reason="posting date: older tha
 def pruned(engine, sid, source="greenhouse"):
     r = row(engine, sid, source)
     return r.raw_digest is not None and r.raw == {} and r.description == ""
+
+
+def test_online_slice_preserves_safety_rules_and_advances_cursor(stored):
+    cursor, total = 0, 0
+    for _ in range(10):
+        result = prune_slice(stored, start_after=cursor, scan=2, batch=1)
+        total += result.pruned
+        cursor = result.last_id
+        if not cursor:
+            break
+    assert total == 2
+    assert pruned(stored, "old") and pruned(stored, "dup")
+    for sid in ("young", "recent", "passed", "held"):
+        assert not pruned(stored, sid)
+
+
+def test_online_slice_yields_instead_of_waiting_for_locked_rows(stored):
+    with stored.begin() as held:
+        held.execute(select(jobs_t).with_for_update()).all()
+        result = prune_slice(stored, start_after=0)
+        assert result.pruned == 0 and result.last_id > 0
+    assert prune_slice(stored, start_after=0).pruned == 2
+
+
+def test_online_cleanup_cursor_survives_worker_restarts(stored):
+    first = prune_slice(stored, scan=1, batch=1)
+    second = prune_slice(stored, scan=1, batch=1)
+    assert second.last_id > first.last_id
+    with stored.connect() as conn:
+        assert int(conn.execute(text("SELECT value FROM app_state WHERE key = 'cleanup_cursor'")).scalar_one()) == second.last_id
+
+
+def test_online_slice_timeout_rolls_back_payload_changes(stored):
+    from sqlalchemy.exc import OperationalError
+    with stored.begin() as conn:
+        conn.execute(text("CREATE FUNCTION slow_prune_test() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.1); RETURN NEW; END $$"))
+        conn.execute(text("CREATE TRIGGER slow_prune_test BEFORE UPDATE ON jobs FOR EACH ROW EXECUTE FUNCTION slow_prune_test()"))
+    try:
+        with pytest.raises(OperationalError):
+            prune_slice(stored, timeout_ms=20)
+        assert not pruned(stored, "old") and not pruned(stored, "dup")
+    finally:
+        with stored.begin() as conn:
+            conn.execute(text("DROP TRIGGER slow_prune_test ON jobs"))
+            conn.execute(text("DROP FUNCTION slow_prune_test()"))
 
 
 @pytest.fixture

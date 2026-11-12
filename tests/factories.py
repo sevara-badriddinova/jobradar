@@ -94,6 +94,18 @@ def ashby_job(job_id: str, **overrides: Any) -> dict[str, Any]:
     return raw
 
 
+# Pipeline lifecycle tests must not age out of the real ingestion window as
+# calendar time advances. Parser tests keep the fixed-date builders above.
+def recent_greenhouse_job(job_id: int, **overrides: Any) -> dict[str, Any]:
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    return greenhouse_job(job_id, **{"first_published": today.isoformat(), **overrides})
+
+
+def recent_ashby_job(job_id: str, **overrides: Any) -> dict[str, Any]:
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    return ashby_job(job_id, **{"publishedAt": today.isoformat(), **overrides})
+
+
 def candidate_profile(**overrides: Any):
     """A realistic CandidateProfile, as the LLM would return it."""
     from jobradar.candidate import CandidateProfile

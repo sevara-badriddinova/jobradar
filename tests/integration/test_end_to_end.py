@@ -11,7 +11,7 @@ from jobradar import cli
 from jobradar.collectors import GreenhouseCollector
 from jobradar.db import collector_runs, jobs as jobs_t
 from jobradar.pipeline import run_all
-from tests.factories import RecordingTransport, greenhouse_job, load_fixture
+from tests.factories import RecordingTransport, recent_greenhouse_job as greenhouse_job, load_fixture
 
 
 class FakeGreenhouse:

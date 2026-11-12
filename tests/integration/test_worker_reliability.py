@@ -146,7 +146,7 @@ class SlowBoards(FakeBoards):
         return inner
 
 
-def test_stop_returns_within_the_deadline_and_releases_leases(engine):
+def test_stop_returns_within_deadline_but_retains_leases_of_unfinished_work(engine):
     boards = SlowBoards(6)
     add_board(engine, "slow")
     boards.snapshots["slow"] = [fresh("s")]
@@ -160,7 +160,8 @@ def test_stop_returns_within_the_deadline_and_releases_leases(engine):
     assert not runner.is_alive() and time.monotonic() - started < 4
     with engine.connect() as conn:
         assert conn.execute(select(func.count()).select_from(board_state)
-                            .where(board_state.c.lease_owner.is_not(None))).scalar_one() == 0
+                            .where(board_state.c.lease_owner.is_not(None))).scalar_one() == 1
+    assert w.background_stuck  # CLI must terminate the process before another owner can write.
     # Let the deliberately abandoned slow collection finish so it cannot write
     # into the next test's freshly truncated tables.
     for t in threading.enumerate():
@@ -235,20 +236,24 @@ def test_legacy_cycle_skips_while_a_worker_runs(engine, db_env, tmp_path, capsys
     assert "another cycle is running; skipped" in capsys.readouterr().out
 
 
-@pytest.mark.skipif(not shutil.which("flock"), reason="util-linux flock not installed")
 def test_poll_unit_lock_skips_while_workers_hold_the_shared_lock(tmp_path):
+    import fcntl
     lock = tmp_path / "maintenance.lock"
-    worker = subprocess.Popen(["flock", "--shared", str(lock), "sleep", "5"])
-    time.sleep(0.5)
-    # The exact poll ExecStart wrapper from the live unit's drop-in.
-    poll = subprocess.run(["flock", "--exclusive", "--nonblock", "--conflict-exit-code", "0", str(lock),
-                           "echo", "POLL RAN"], capture_output=True, text=True)
-    # Backups block (no --nonblock) until the workers are stopped.
-    backup = subprocess.run(["flock", "--exclusive", "--wait", "1", str(lock), "true"])
-    worker.terminate()
-    worker.wait()
-    assert poll.returncode == 0 and "POLL RAN" not in poll.stdout
-    assert backup.returncode == 1
+    # fcntl uses the same flock locks as util-linux and also runs on macOS.
+    worker = subprocess.Popen([sys.executable, "-c",
+        "import fcntl,sys; f=open(sys.argv[1],'a'); fcntl.flock(f,fcntl.LOCK_SH); "
+        "print('locked',flush=True); sys.stdin.read()", str(lock)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert worker.stdout.readline().strip() == "locked"
+        with lock.open("a") as poll:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(poll, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with lock.open("a") as backup:
+            # Online backups now coexist with workers; compaction still excludes both.
+            fcntl.flock(backup, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    finally:
+        worker.communicate("", timeout=5)
 
 
 # --- Telegram queue (Mini App) delivery --------------------------------------------------

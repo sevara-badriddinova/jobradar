@@ -6,6 +6,11 @@ services:
     image: ${JOBRADAR_IMAGE:?Set an immutable image digest}
     profiles: [workers]
     env_file: runtime.env
+    environment:
+      JOBRADAR_CONTROL_DIR: /run/jobradar
+      JOBRADAR_ONLINE_CLEANUP: "1"
+    volumes:
+      - /run/jobradar:/run/jobradar
     init: true
     command: [worker, --discover, --collect-concurrency, "4", --byte-budget-mb, "64"]
     # Measured peak under load with a 78 MB board: ~320 MiB anonymous RSS.

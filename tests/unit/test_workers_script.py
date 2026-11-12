@@ -13,7 +13,7 @@ def run_wait_poll(tmp_path, states):
     fake.write_text(f"""#!/bin/bash
 echo "$*" >> {tmp_path}/calls
 if [[ $1 == show ]]; then
-  s=$(head -n1 {tmp_path}/states); sed -i 1d {tmp_path}/states; echo "${{s:-inactive}}"
+  s=$(head -n1 {tmp_path}/states); tail -n +2 {tmp_path}/states > {tmp_path}/next; mv {tmp_path}/next {tmp_path}/states; echo "${{s:-inactive}}"
 fi
 """)
     fake.chmod(0o755)
@@ -40,3 +40,20 @@ def test_returns_immediately_when_idle(tmp_path):
 
 def test_failed_last_cycle_does_not_block(tmp_path):
     assert "sleep" not in run_wait_poll(tmp_path, ["failed"])
+
+
+def test_compaction_reports_failed_recovery_instead_of_success(tmp_path):
+    script = SCRIPT.with_name("compact-jobs.sh").read_text()
+    body = script[script.index("restart() {"):script.index("\ntrap restart EXIT")]
+    for name in ("docker", "systemctl", "flock"):
+        fake = tmp_path / name
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(0o755)
+    verify = tmp_path / "python3"
+    verify.write_text("#!/bin/sh\nexit 1\n")
+    verify.chmod(0o755)
+    command = "log() { echo \"$*\"; }; resume=1; listener_resume=1;\n" + body + "\ntrue; restart"
+    result = subprocess.run(["bash", "-c", command], capture_output=True, text=True,
+                            env={"PATH": f"{tmp_path}:/usr/bin:/bin"})
+    assert result.returncode == 1 and "ERROR" in result.stdout
+    assert "recovery verified" not in result.stdout

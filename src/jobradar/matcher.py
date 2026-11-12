@@ -337,6 +337,8 @@ def run_matching(engine: Engine, profile: Row, preferences: Preferences, *,
         result.attempted_ids.append(job.id)
         try:
             match_id, match_score, was_cached = _assess(engine, job, profile, preferences, key)
+        except llm.CredentialsRejected:
+            raise  # the account, not this job: callers pause and keep the work queued
         except llm.LLMError as exc:
             result.failed += 1
             result.failed_ids.append(job.id)

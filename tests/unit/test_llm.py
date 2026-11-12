@@ -59,3 +59,41 @@ def test_missing_api_key_is_a_clear_llm_error(monkeypatch):
             llm.ask(Answer, system="s", prompt="p", model="m")
     finally:
         llm._client.cache_clear()
+
+
+def _api_error(cls, status, message):
+    import httpx
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    return cls(message=message, response=httpx.Response(status, request=request), body=None)
+
+
+@pytest.mark.parametrize("cls,status,message,reason", [
+    (anthropic.AuthenticationError, 401, "invalid x-api-key", "401 invalid or revoked API key"),
+    (anthropic.PermissionDeniedError, 403, "permission_error", "403 key lacks permission"),
+    (anthropic.BadRequestError, 400, "Your credit balance is too low to access the Anthropic API.",
+     "account credit balance too low"),
+])
+def test_rejected_credentials_are_their_own_llm_error(client, cls, status, message, reason):
+    client(_api_error(cls, status, message))
+    with pytest.raises(llm.CredentialsRejected) as caught:
+        llm.ask(Answer, system="s", prompt="p", model="m")
+    assert caught.value.reason == reason
+    assert isinstance(caught.value, llm.LLMError)   # callers that catch LLMError keep working
+
+
+def test_other_bad_requests_stay_ordinary_llm_errors(client):
+    client(_api_error(anthropic.BadRequestError, 400, "prompt is too long"))
+    with pytest.raises(llm.LLMError) as caught:
+        llm.ask(Answer, system="s", prompt="p", model="m")
+    assert not isinstance(caught.value, llm.CredentialsRejected)
+
+
+def test_missing_api_key_counts_as_rejected_credentials(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    llm._client.cache_clear()
+    try:
+        with pytest.raises(llm.CredentialsRejected):
+            llm.ask(Answer, system="s", prompt="p", model="m")
+    finally:
+        llm._client.cache_clear()
