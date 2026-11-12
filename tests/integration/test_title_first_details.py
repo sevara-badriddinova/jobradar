@@ -7,7 +7,7 @@ finishing. ~93% of postings are rejected by title anyway.
 """
 
 import json
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -59,6 +59,10 @@ def workday_server(n=45, posted="Posted Today", pad=4000, fail_detail=()):
         item = next(x for x in listing if x["externalPath"].endswith(f"_R{i}"))
         detail = workday_detail(i)
         detail["jobPostingInfo"]["title"] = item["title"]
+        if posted == "Posted Today":
+            # Match the listing. The fixture's fixed Oct 12 date aged past the
+            # 30-day ingestion window on Nov 12, 2026 and dropped these jobs.
+            detail["jobPostingInfo"]["startDate"] = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
         detail["jobPostingInfo"]["jobDescription"] += "x" * pad
         return httpx.Response(200, json=detail)
     return calls, httpx.Client(transport=httpx.MockTransport(handle))

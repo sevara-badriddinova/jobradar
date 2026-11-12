@@ -243,7 +243,13 @@ def workday_board(labels):
         if request.method == "POST":
             return httpx.Response(200, json={"total": len(labels), "jobPostings": [
                 workday_item(i, label) for i, label in labels.items()]})
-        return httpx.Response(200, json=workday_detail(request.url.path.rsplit("_R", 1)[-1]))
+        i = request.url.path.rsplit("_R", 1)[-1]
+        detail = workday_detail(i)
+        # Date the detail like its label. The fixture's fixed Oct 12 date aged
+        # past the 30-day ingestion window on Nov 12, 2026.
+        days = int(labels[i].split()[1].rstrip("+")) if labels[i].startswith("Posted ") and labels[i].split()[1][0].isdigit() else 0
+        detail["jobPostingInfo"]["startDate"] = (datetime.now(UTC) - timedelta(days=days, hours=2)).isoformat()
+        return httpx.Response(200, json=detail)
     return handler
 
 
