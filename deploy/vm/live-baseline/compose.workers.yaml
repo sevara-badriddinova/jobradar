@@ -7,7 +7,7 @@ services:
     profiles: [workers]
     env_file: runtime.env
     init: true
-    command: [worker, --discover, --collect-concurrency, "4", --byte-budget-mb, "64"]
+    command: [worker, --discover, --collect-concurrency, "2", --byte-budget-mb, "64"]
     # Measured peak under load with a 78 MB board: ~320 MiB anonymous RSS.
     mem_limit: 512m
     memswap_limit: 1024m
