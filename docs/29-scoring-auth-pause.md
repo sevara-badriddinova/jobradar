@@ -1,6 +1,6 @@
 # Rejected API key: pause, alert, recover — November 11, 2026
 
-Status: **1,256 tests pass** (Linux, Python 3.13, PostgreSQL 16). **Not deployed**; ships
+Status: **1,257 tests pass** (Linux, Python 3.13, PostgreSQL 16). **Not deployed**; ships
 with the docs/28 overlay, which touches the same files.
 
 ## What happened
@@ -36,6 +36,42 @@ does not carry the hotfix: **when applying docs/28, pass Anthropic version 3.**
   are open, filtered, unreviewed, unscored and inside the freshness window
   (`max_posting_age_days`, `max_discovery_age_days`). Older ones stay dead; matching
   would skip them anyway. Plain `requeue match` still queues every eligible job.
+
+## VM hotfixes, now in the repo (Nov 12)
+
+Two changes were made by hand on the VM. Both are now in `deploy/vm/cloud_io.py`,
+so the release keeps them:
+
+1. **Anthropic key version 3.** The hotfix pins it in the VM's `cloud_io.py`. The
+   release instead records it in `/opt/jobradar/anthropic-secret-version`
+   (apply argument `3`).
+2. **$1 daily AI budget.** `configure` rewrites `runtime.env` on every stack start,
+   so the hand-added `JOBRADAR_AI_DAILY_BUDGET_USD` line was lost on Nov 11 and
+   matching ran uncapped for a day. The value is now part of `configure`.
+
+`deploy/vm/live-baseline/` holds the VM's host files exactly as they are now
+(`b40bb90` plus those two hotfixes). The apply script refuses to run if the VM
+differs from them.
+
+## Release (docs/28 + this change)
+
+From a full clone of the release branch in Cloud Shell:
+
+```sh
+bash deploy/vm/cloudshell-release.sh check    # VM == live-baseline; image == b40bb90 source
+bash deploy/vm/cloudshell-release.sh build    # package, build overlay, push, test the pushed digest
+bash deploy/vm/cloudshell-release.sh apply    # guarded apply; restores the old setup on failure
+bash deploy/vm/cloudshell-release.sh verify
+```
+
+Release fixes found while preparing it:
+- The image overlay is now every file under `src/jobradar` changed since the
+  production source (`PRODUCTION_SOURCE` in `package-reliability.py`). The old
+  hand-kept list would have shipped the new `worker.py` without `llm.py` and
+  `matcher.py`.
+- Test evidence also records the pushed digest reference (line 4). Image IDs differ
+  between Docker's classic and containerd image stores, and the VM uses containerd,
+  so the ID check alone would refuse a correctly tested image.
 
 ## After deploying
 

@@ -40,5 +40,8 @@ docker run --name "$id-app" --network "$id" --memory 512m --memory-swap 1024m \
   sha256sum SHA256SUMS
   echo "$image_id"
   date -u +%FT%TZ
+  # Line 4: the pushed digest reference, when tested by one. Image IDs differ
+  # between Docker's classic and containerd image stores; a digest does not.
+  case "$image" in *@sha256:*) echo "$image";; esac
 } > linux-pg16-tests-passed.txt
 echo 'Linux/PostgreSQL 16 suite passed under worker/database memory limits.'

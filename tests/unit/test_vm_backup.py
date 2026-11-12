@@ -191,3 +191,24 @@ def test_backup_resumes_heavy_work_before_network_upload(tmp_path, monkeypatch):
     monkeypatch.setattr(backup, "upload_file", upload)
     monkeypatch.setattr(backup, "publish_backup_health", lambda state: None)
     backup.backup()
+
+
+def test_configure_writes_the_budget_and_reads_the_pinned_key_version(tmp_path, monkeypatch):
+    # configure rewrites runtime.env on every stack start; a line added by hand
+    # was lost on Nov 11, 2026 and matching ran uncapped for a day.
+    monkeypatch.setattr(backup, "ROOT", tmp_path)
+    monkeypatch.setattr(backup, "DATA", tmp_path)
+    (tmp_path / "anthropic-secret-version").write_text("3\n")
+    monkeypatch.setattr(backup, "token", lambda: "test-access")
+    asked = {}
+    def fetch(name, access, version="1"):
+        asked[name] = version
+        return f"{name}-value"
+    monkeypatch.setattr(backup, "secret", fetch)
+    monkeypatch.setattr(backup.subprocess, "run", lambda *a, **k: None)
+    backup.configure()
+    env = (tmp_path / "runtime.env").read_text()
+    assert "JOBRADAR_AI_DAILY_BUDGET_USD='1'\n" in env
+    assert "ANTHROPIC_API_KEY='jobradar-anthropic-key-value'\n" in env
+    assert asked == {"jobradar-anthropic-key": "3", "jobradar-telegram-token": "1",
+                     "jobradar-telegram-chat-id": "1"}

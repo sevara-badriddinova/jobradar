@@ -14,7 +14,9 @@ sha256sum -c SHA256SUMS
 # Evidence is prepared only after running the bundled source against PG16/Linux.
 test -s linux-pg16-tests-passed.txt
 head -n 1 linux-pg16-tests-passed.txt | sha256sum -c -
-[[ $(sed -n '2p' linux-pg16-tests-passed.txt) == $(docker image inspect -f '{{.Id}}' "$new_image") ]] || {
+# Same content: the digest reference that was tested, or (same Docker store) the image ID.
+[[ $(sed -n '4p' linux-pg16-tests-passed.txt) == "$new_image" ||
+   $(sed -n '2p' linux-pg16-tests-passed.txt) == $(docker image inspect -f '{{.Id}}' "$new_image") ]] || {
   echo 'Test evidence belongs to a different image'; exit 1;
 }
 for f in compose.yaml compose.workers.yaml cloud_io.py compact-jobs.sh; do

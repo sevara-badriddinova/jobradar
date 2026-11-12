@@ -1,0 +1,46 @@
+name: jobradar
+x-worker: &worker
+  image: ${JOBRADAR_IMAGE:?Set an immutable image digest}
+  env_file: runtime.env
+  init: true
+  mem_limit: 512m
+  memswap_limit: 1024m
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+  depends_on:
+    postgres:
+      condition: service_healthy
+services:
+  postgres:
+    image: postgres:16-bookworm
+    restart: unless-stopped
+    env_file: postgres.env
+    mem_limit: 256m
+    memswap_limit: 512m
+    shm_size: 64m
+    command: [postgres, -c, shared_buffers=64MB, -c, work_mem=2MB, -c, maintenance_work_mem=32MB, -c, max_connections=30]
+    volumes:
+      - /var/lib/jobradar/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U jobradar -d jobradar"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+  listener:
+    <<: *worker
+    command: [telegram, listen]
+    restart: unless-stopped
+    mem_limit: 128m
+    memswap_limit: 256m
+  poll:
+    <<: *worker
+    profiles: [manual]
+    command: [cycle, --discover, --collect-limit, "50", --match, --match-limit, "25", --notify, --digest]

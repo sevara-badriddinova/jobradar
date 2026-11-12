@@ -156,7 +156,7 @@ def prepare_rotated_env(version, destination):
 
 def configure():
     access_token = token()
-    password_file = Path("/var/lib/jobradar/database-password")
+    password_file = DATA / "database-password"
     if not password_file.exists():
         secure_write(password_file, secrets.token_hex(32))
     password = password_file.read_text().strip()
@@ -168,6 +168,10 @@ def configure():
         "JOBRADAR_REGION": "us-east1",
         "JOBRADAR_POLL_JOB": "jobradar-poll",
         "JOBRADAR_HEALTH_BUCKET": BUCKET,
+        # $1 per UTC day, paced hourly (docs/26). It belongs here: configure
+        # rewrites runtime.env on every stack start, so a line added by hand
+        # is lost (Nov 11, 2026: matching ran uncapped for a day).
+        "JOBRADAR_AI_DAILY_BUDGET_USD": "1",
     }
     for key, name in {"ANTHROPIC_API_KEY": "jobradar-anthropic-key",
                       "TELEGRAM_BOT_TOKEN": "jobradar-telegram-token",
