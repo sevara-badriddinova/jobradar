@@ -91,14 +91,19 @@ def _client() -> anthropic.Anthropic:
     return anthropic.Anthropic()
 
 
-def ask(output: type[T], *, system: str, prompt: str, model: str, max_tokens: int = 4096) -> T:
-    """Return the model's answer as an instance of `output` (structured outputs)."""
+def ask(output: type[T], *, system: str, prompt: str, model: str, max_tokens: int = 4096,
+        effort: str | None = None) -> T:
+    """Return the model's answer as an instance of `output` (structured outputs).
+
+    `effort` ("low" ... "max") is sent only when given: models without effort
+    control reject it."""
     if _meter is not None:
         _meter.check()
+    extra = {"output_config": {"effort": effort}} if effort else {}
     try:
         response = _client().messages.parse(
             model=model, max_tokens=max_tokens, system=system,
-            messages=[{"role": "user", "content": prompt}], output_format=output,
+            messages=[{"role": "user", "content": prompt}], output_format=output, **extra,
         )
     except (anthropic.AnthropicError, ValidationError) as exc:
         reason = _credentials_reason(exc)

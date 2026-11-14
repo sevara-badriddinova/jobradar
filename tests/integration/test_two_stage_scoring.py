@@ -24,8 +24,8 @@ def screened(monkeypatch):
 
 def by_model(answers):
     """FakeLLM answer per model: {model: assessment}."""
-    def ask(output, *, system, prompt, model, max_tokens=4096):
-        fake.calls.append({"model": model, "max_tokens": max_tokens, "system": system})
+    def ask(output, *, system, prompt, model, max_tokens=4096, effort=None):
+        fake.calls.append({"model": model, "max_tokens": max_tokens, "system": system, "effort": effort})
         return answers[model]
     fake = FakeLLM()
     return fake, ask
@@ -46,7 +46,7 @@ def test_job_above_the_gate_gets_the_main_model(monkeypatch, screened):
     a, model = matcher.assess(job(), candidate_profile().model_dump(), Preferences())
     assert (matcher.score(a), model) == (90.0, matcher.DEFAULT_MODEL)
     assert [c["model"] for c in fake.calls] == ["screen-model", matcher.DEFAULT_MODEL]
-    assert fake.calls[1]["max_tokens"] == 2048
+    assert fake.calls[1]["max_tokens"] == matcher.MATCH_MAX_TOKENS
 
 
 def test_gate_is_configurable(monkeypatch, screened):
@@ -60,7 +60,7 @@ def test_screen_rejection_is_audited_by_the_screen_model(monkeypatch, screened):
     rejected = assessment(eligible=False, ineligible_reason="unclear")
     calls = []
 
-    def ask(output, *, system, prompt, model, max_tokens=4096):
+    def ask(output, *, system, prompt, model, max_tokens=4096, effort=None):
         calls.append((model, "Independently audit" in system))
         return rejected if not calls[1:] else LOW
     monkeypatch.setattr(matcher.llm, "ask", ask)
@@ -93,7 +93,7 @@ def test_run_matching_stores_the_model_that_scored(engine, monkeypatch, screened
     seed(engine, n=2)
     profile = add_profile(engine)
 
-    def ask(output, *, system, prompt, model, max_tokens=4096):
+    def ask(output, *, system, prompt, model, max_tokens=4096, effort=None):
         if model == "screen-model":
             return HIGH if "Backend Engineer 0" in prompt else LOW
         return MAIN

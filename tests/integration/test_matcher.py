@@ -160,7 +160,7 @@ def test_concurrent_run_storing_first_wins(engine, monkeypatch):
     key = context_hash(profile.id, PREFS, row(engine, "j0"), profile.profile)
     job_id = row(engine, "j0").id
 
-    def other_process_got_there_first(output, *, system, prompt, model, max_tokens=4096):
+    def other_process_got_there_first(output, *, system, prompt, model, max_tokens=4096, effort=None):
         with engine.begin() as conn:
             conn.execute(insert(job_matches).values(
                 job_id=job_id, profile_id=profile.id, context_hash=key, model="m", prompt_version="1",
@@ -205,3 +205,18 @@ class TestCli:
         add_profile(engine)
         llm(LLMError("boom"))
         assert cli.main(["match"]) == 1
+
+
+def test_switching_the_model_keeps_stored_matches(engine, llm, monkeypatch):
+    """Nov 14: moving the VM to Haiku 5.5 must not withdraw and re-score every match."""
+    seed(engine)
+    profile = add_profile(engine)
+    llm(assessment(role_match=8, technical_match=7, experience_match=9))
+    monkeypatch.setenv("JOBRADAR_MATCH_MODEL", "claude-haiku-4-5-20251001")
+    assert run_matching(engine, profile, PREFS).assessed == 3
+
+    monkeypatch.setenv("JOBRADAR_MATCH_MODEL", "claude-haiku-5-5")
+    with engine.begin() as conn:
+        assert matcher.invalidate_stale_matches(conn, profile, PREFS) == 0
+    assert run_matching(engine, profile, PREFS).assessed == 0
+    assert row(engine, "j0").status == "MATCHED"

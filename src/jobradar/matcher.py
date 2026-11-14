@@ -33,7 +33,18 @@ log = logging.getLogger(__name__)
 # Bump when SYSTEM, the prompt layout or MatchAssessment changes: jobs then get
 # re-assessed by `match --rematch` instead of reusing stale answers.
 PROMPT_VERSION = "4"
-DEFAULT_MODEL = "claude-haiku-4-5-20251001"  # one call per job: the fast, cheap model
+# Nov 14: Haiku 5.5 scores every job in one call. It used to be only the screen
+# in front of Haiku 4.5, which cost 55% of the AI bill ($5.84 of $10.63 in 30
+# days) while scoring ~10% of the jobs. With the main model equal to
+# SCREEN_MODEL, assess() skips the screen stage.
+DEFAULT_MODEL = "claude-haiku-5-5"
+MATCH_MAX_TOKENS = 4096  # Haiku 5.5 thinks before answering, and thinking counts toward max_tokens
+MATCH_EFFORT = "low"     # JOBRADAR_MATCH_EFFORT overrides; "default" leaves the model's own (medium)
+EFFORT_MODELS = ("claude-haiku-5",)  # older models reject the effort parameter
+# Stored assessments are keyed by this, not by the model in use: switching
+# JOBRADAR_MATCH_MODEL scores new jobs with the new model without withdrawing
+# and re-scoring every stored match. Change this value to force a re-score.
+SCORING_GENERATION = "claude-haiku-4-5-20251001"
 MAX_DESCRIPTION_CHARS = 12_000  # long postings are mostly benefits/boilerplate at the end
 MAX_CONSECUTIVE_FAILURES = 3
 
@@ -129,7 +140,7 @@ Rules:
 def context_hash(profile_id: int, preferences: Preferences, job=None, profile_data=None) -> str:
     """Everything that, if changed, should invalidate a stored assessment."""
     context = {"profile_id": profile_id, "preferences": preferences.model_dump(exclude={"resume"}),
-               "prompt_version": PROMPT_VERSION, "model": model_name(),
+               "prompt_version": PROMPT_VERSION, "model": SCORING_GENERATION,
                "weights": WEIGHTS, "graduation_cap": GRADUATION_MISMATCH_CAP}
     if profile_data is not None:
         context["candidate"] = normalize_experience(profile_data)
@@ -210,12 +221,13 @@ def assess(job, profile: dict, preferences: Preferences) -> tuple[MatchAssessmen
 
 
 def assess_with_review(job, profile: dict, preferences: Preferences, *, model: str | None = None,
-                       max_tokens: int = 2048) -> MatchAssessment:
+                       max_tokens: int = MATCH_MAX_TOKENS) -> MatchAssessment:
     model = model or model_name()
+    effort = match_effort(model)
     profile = normalize_experience(profile)
     prompt = build_prompt(job, profile, preferences)
     answer = llm.ask(MatchAssessment, system=SYSTEM, prompt=prompt,
-                     model=model, max_tokens=max_tokens)
+                     model=model, max_tokens=max_tokens, effort=effort)
     skills = known_skills(profile)
     if (not answer.eligible or answer.graduation_match is False
             or any(_normalized(s) in skills for s in answer.missing_skills)):
@@ -223,7 +235,7 @@ def assess_with_review(job, profile: dict, preferences: Preferences, *, model: s
             "Correct unsupported rejections, ignored full-time employment, and false missing skills. "
             "Return a complete corrected assessment, including recalculated fit dimensions.",
             prompt=prompt + "\n<prior_assessment>\n" + answer.model_dump_json() + "\n</prior_assessment>",
-            model=model, max_tokens=max_tokens)
+            model=model, max_tokens=max_tokens, effort=effort)
     valid = verified_blockers(answer, job, profile, preferences)
     updates = {"hard_blockers": valid,
                "missing_skills": [s for s in answer.missing_skills if _normalized(s) not in skills]}
@@ -261,6 +273,14 @@ Locations: {locations}
 
 def model_name() -> str:
     return os.environ.get("JOBRADAR_MATCH_MODEL", DEFAULT_MODEL)
+
+
+def match_effort(model: str) -> str | None:
+    """The effort to request, or None to send no effort parameter."""
+    value = os.environ.get("JOBRADAR_MATCH_EFFORT", MATCH_EFFORT).strip().lower()
+    if value in ("", "default", "off", "none") or not model.startswith(EFFORT_MODELS):
+        return None
+    return value
 
 
 def screen_model() -> str | None:

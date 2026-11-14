@@ -163,7 +163,7 @@ def configure():
     secure_write(ROOT / "postgres.env", f"POSTGRES_USER=jobradar\nPOSTGRES_DB=jobradar\nPOSTGRES_PASSWORD={password}\n")
     env = {
         "JOBRADAR_DATABASE_URL": f"postgresql+psycopg://jobradar:{password}@postgres:5432/jobradar",
-        "JOBRADAR_MATCH_MODEL": "claude-haiku-4-5-20251001",
+        "JOBRADAR_MATCH_MODEL": "claude-haiku-5-5",
         "GOOGLE_CLOUD_PROJECT": PROJECT,
         "JOBRADAR_REGION": "us-east1",
         "JOBRADAR_POLL_JOB": "jobradar-poll",

@@ -74,13 +74,24 @@ class TestContextHash:
     def test_changes_with_profile_or_preferences(self, change):
         assert change() != context_hash(1, Preferences())
 
-    def test_changes_with_model_and_prompt_version(self, monkeypatch):
+    def test_changes_with_scoring_generation_and_prompt_version(self, monkeypatch):
         base = context_hash(1, Preferences())
-        monkeypatch.setenv("JOBRADAR_MATCH_MODEL", "claude-sonnet-5-5")
+        generation = matcher.SCORING_GENERATION
+        monkeypatch.setattr(matcher, "SCORING_GENERATION", "claude-haiku-5-5")
         assert context_hash(1, Preferences()) != base
-        monkeypatch.delenv("JOBRADAR_MATCH_MODEL")
+        monkeypatch.setattr(matcher, "SCORING_GENERATION", generation)
         monkeypatch.setattr(matcher, "PROMPT_VERSION", "2")
         assert context_hash(1, Preferences()) != base
+
+    def test_switching_the_model_keeps_stored_assessments(self, monkeypatch):
+        """Nov 14: moving to Haiku 5.5 must not withdraw and re-score every stored match."""
+        base = context_hash(1, Preferences())
+        monkeypatch.setenv("JOBRADAR_MATCH_MODEL", "claude-sonnet-5-5")
+        assert context_hash(1, Preferences()) == base
+
+    def test_hash_matches_what_the_vm_stored_before_the_switch(self):
+        """The VM ran with JOBRADAR_MATCH_MODEL=claude-haiku-4-5-20251001: same key, same hashes."""
+        assert matcher.SCORING_GENERATION == "claude-haiku-4-5-20251001"
 
     def test_resume_path_does_not_matter(self):
         assert context_hash(1, Preferences(resume="a.pdf")) == context_hash(1, Preferences(resume="b.pdf"))
