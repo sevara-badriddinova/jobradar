@@ -18,7 +18,7 @@ import tarfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-PRODUCTION_SOURCE = "b40bb90"   # Oct 29, 2026: two-stage scoring, running on jobradar-vm
+PRODUCTION_SOURCE = "2deb4aa"   # Nov 12, 2026 reliability release, running on jobradar-vm (recovery timer seen Nov 14)
 LIVE_BASELINE = ROOT / "deploy/vm/live-baseline"
 BASELINE_FILES = ("compose.yaml", "compose.workers.yaml", "cloud_io.py", "compact-jobs.sh")
 

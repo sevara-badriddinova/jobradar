@@ -23,6 +23,10 @@ PROJECT = "jobradar-510801"
 BUCKET = PROJECT + "-jobradar-health"
 ROOT = Path("/opt/jobradar")
 DATA = Path("/var/lib/jobradar")
+# Nov 14: Haiku 5.5 scores every job (docs/30). Set both at stack start
+# (configure) and at deploy time (prepare_rotated_env), which keeps the rest of
+# runtime.env as it is.
+MATCH_MODEL = "claude-haiku-5-5"
 
 
 def progress(message):
@@ -135,7 +139,7 @@ def secure_write(path, body):
 
 
 def prepare_rotated_env(version, destination):
-    """Stage only the new key, before stopping any service; never print it."""
+    """Stage the new key and the scoring model, before stopping any service; never print the key."""
     version = numbered(version)
     value = secret("jobradar-anthropic-key", token(), version)
     if not value or not value.isascii() or not all(33 <= ord(c) <= 126 for c in value) or any(c in value for c in "'$\\"):
@@ -151,6 +155,14 @@ def prepare_rotated_env(version, destination):
         if not json.load(response).get("data"):
             raise ValueError("New credential cannot list models")
     lines[positions[0]] = f"ANTHROPIC_API_KEY='{value}'\n"
+    model = f"JOBRADAR_MATCH_MODEL='{MATCH_MODEL}'\n"
+    models = [i for i, line in enumerate(lines) if line.startswith("JOBRADAR_MATCH_MODEL=")]
+    if len(models) > 1:
+        raise ValueError("Expected at most one scoring model entry in the existing runtime settings")
+    if models:
+        lines[models[0]] = model
+    else:
+        lines.append(model)
     secure_write(destination, "".join(lines))
 
 
@@ -163,7 +175,7 @@ def configure():
     secure_write(ROOT / "postgres.env", f"POSTGRES_USER=jobradar\nPOSTGRES_DB=jobradar\nPOSTGRES_PASSWORD={password}\n")
     env = {
         "JOBRADAR_DATABASE_URL": f"postgresql+psycopg://jobradar:{password}@postgres:5432/jobradar",
-        "JOBRADAR_MATCH_MODEL": "claude-haiku-5-5",
+        "JOBRADAR_MATCH_MODEL": MATCH_MODEL,
         "GOOGLE_CLOUD_PROJECT": PROJECT,
         "JOBRADAR_REGION": "us-east1",
         "JOBRADAR_POLL_JOB": "jobradar-poll",

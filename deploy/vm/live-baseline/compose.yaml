@@ -36,6 +36,10 @@ services:
         max-file: "3"
   listener:
     <<: *worker
+    environment:
+      JOBRADAR_CONTROL_DIR: /run/jobradar
+    volumes:
+      - /run/jobradar:/run/jobradar
     command: [telegram, listen]
     restart: unless-stopped
     mem_limit: 128m

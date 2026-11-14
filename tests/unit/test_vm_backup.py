@@ -38,9 +38,25 @@ def test_rotation_stages_only_one_secret_and_requires_valid_provider_auth(tmp_pa
     assert runtime.read_text() == original
     monkeypatch.setattr(backup, "urlopen", lambda *a, **k: io.BytesIO(b'{"data":[{"id":"test"}]}'))
     backup.prepare_rotated_env("7", staged)
-    assert staged.read_text() == original.replace("'old'", "'new-test-key'")
+    assert staged.read_text() == (original.replace("'old'", "'new-test-key'")
+                                  + "JOBRADAR_MATCH_MODEL='claude-haiku-5-5'\n")
     assert staged.stat().st_mode & 0o777 == 0o600
     assert runtime.read_text() == original
+
+
+def test_rotation_switches_the_scoring_model_in_place(tmp_path, monkeypatch):
+    """Nov 14: the deploy keeps runtime.env, so it must also carry the Haiku 5.5 switch."""
+    monkeypatch.setattr(backup, "ROOT", tmp_path)
+    original = ("JOBRADAR_MATCH_MODEL='claude-haiku-4-5-20251001'\nANTHROPIC_API_KEY='old'\n"
+                "JOBRADAR_AI_DAILY_BUDGET_USD='1'\n")
+    (tmp_path / "runtime.env").write_text(original)
+    monkeypatch.setattr(backup, "token", lambda: "test-access")
+    monkeypatch.setattr(backup, "secret", lambda name, access, version: "new-test-key")
+    monkeypatch.setattr(backup, "urlopen", lambda *a, **k: io.BytesIO(b'{"data":[{"id":"test"}]}'))
+    staged = tmp_path / "prepared.env"
+    backup.prepare_rotated_env("3", staged)
+    assert staged.read_text() == ("JOBRADAR_MATCH_MODEL='claude-haiku-5-5'\nANTHROPIC_API_KEY='new-test-key'\n"
+                                  "JOBRADAR_AI_DAILY_BUDGET_USD='1'\n")
 
 
 def test_rotation_pins_a_number_and_rejects_bad_pins_before_fetch(tmp_path, monkeypatch):
